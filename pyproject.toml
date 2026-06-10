@@ -1,0 +1,45 @@
+[project]
+name = "kob"
+version = "0.3.0"
+description = "kob — a tiny, self-discovering, read-only Parquet query server. Drop Parquet in a folder; query it as Arrow, blazing fast."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+
+# Core server: tiny surface — DuckDB engine + Arrow + a thin ASGI layer. Nothing else.
+dependencies = [
+    "duckdb>=1.5.3",
+    "pyarrow>=24.0.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+# Sample-data generator (synthetic GeoRev / OptionMetrics fixtures).
+gen = ["numpy>=2.0", "scipy>=1.13", "pandas>=2.2"]
+# Reference Python client CLI.
+client = ["requests>=2.32", "pandas>=2.2"]
+# Benchmark harness + the gRPC/Protobuf comparison baseline.
+bench = ["requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7"]
+# Everything, for development.
+all = ["numpy>=2.0", "scipy>=1.13", "pandas>=2.2", "requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7"]
+
+[project.scripts]
+# The product (core install is enough):
+kob = "kob.server_http:main"                 # the server: kob --port 8000
+kob-flight = "kob.server_flight:main"        # optional Arrow Flight transport
+# Tooling (needs the matching extra):
+kob-gen = "kob.generate_data:main"           # [gen]    sample datasets
+kob-client = "kob.client:main"               # [client] reference client
+kob-bench = "kob.benchmark:main"             # [bench]  transport shoot-out
+kob-proto = "kob.server_proto:main"          # [bench]  gRPC/Protobuf baseline
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kob"]
+
+[tool.uv]
+package = true
