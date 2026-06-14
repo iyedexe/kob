@@ -196,10 +196,11 @@ For serving Parquet-backed dataframes to Python + C# (+ C++/Excel):
 
 1. **Use Apache Arrow on the wire.** Not JSON (150–1750× slower, 8× heavier), not protobuf
    (5–56× slower).
-2. **Start with Option B (Arrow IPC over HTTP).** ~90% of Flight's speed with trivial infra;
-   enable `zstd` across a network.
-3. **Graduate to Flight (Option A)** when you need maximum throughput, parallel/partitioned
-   streams, or many concurrent clients.
+2. **Default to Arrow Flight (Option A)** for maximum throughput, parallel/partitioned streams
+   and many concurrent clients — this is what `kob` runs by default.
+3. **Arrow-IPC-over-HTTP (Option B) is a fine fallback** (~90% of Flight's speed, trivial infra,
+   works through any proxy) when gRPC is inconvenient; enable `zstd` across a network. kob ships
+   it as the standalone `kob-demo-arrow` server.
 4. **Keep JSON only for tiny/metadata/debug endpoints**, and reserve protobuf for *control
    messages* — exactly where Arrow Flight itself uses it.
 

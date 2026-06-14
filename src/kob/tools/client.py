@@ -1,18 +1,21 @@
-"""Reference Python client for both transports (install extra: ``kob[client]``).
+"""Reference Python client (install extra: ``kob[client]``).
+
+Two transports: **Flight** (the product's fast, default path, on :8815) and **HTTP-Arrow**
+(the Arrow-over-HTTP demo server, on :8001).
 
 Importable API::
 
-    from kob.client import query_http, query_flight
-    from kob.contract import QueryRequest, Filter
+    from kob.tools.client import query_flight, query_http
+    from kob.core.contract import QueryRequest, Filter
 
-    tbl = query_http("http://127.0.0.1:8000",
-                     QueryRequest(dataset="events",
-                                  filters=[Filter("region", "=", "eu")]))
+    tbl = query_flight("grpc://127.0.0.1:8815",
+                       QueryRequest(dataset="events",
+                                    filters=[Filter("region", "=", "eu")]))
 
 CLI::
 
     kob-client --dataset events --filter 'region:=:eu' --filter 'amount:>=:100'
-    kob-client --transport flight --dataset events --columns user_id,amount --limit 10
+    kob-client --transport http --dataset events --columns user_id,amount --limit 10
 """
 
 from __future__ import annotations
@@ -24,14 +27,24 @@ import time
 import pyarrow as pa
 import requests
 
-from .contract import Filter, QueryRequest
+from ..core.contract import Filter, QueryRequest
+
+
+def query_flight(location: str, req: QueryRequest) -> pa.Table:
+    """Discover the flight then DoGet the Arrow stream (the fast, recommended path)."""
+    import pyarrow.flight as flight  # lazy: not needed for HTTP-only use
+
+    client = flight.connect(location)
+    descriptor = flight.FlightDescriptor.for_command(json.dumps(req.to_dict()).encode())
+    info = client.get_flight_info(descriptor)
+    return client.do_get(info.endpoints[0].ticket).read_all()
 
 
 def query_http(base_url: str, req: QueryRequest, compression: str = "zstd") -> pa.Table:
-    """POST the query and read back the streamed Arrow IPC response (zero-copy)."""
+    """POST to the Arrow-over-HTTP demo server and read back the Arrow IPC stream."""
     resp = requests.post(
         f"{base_url.rstrip('/')}/query",
-        params={"compression": compression, "format": "arrow"},
+        params={"compression": compression},
         json=req.to_dict(),
         stream=True,
         timeout=600,
@@ -41,17 +54,8 @@ def query_http(base_url: str, req: QueryRequest, compression: str = "zstd") -> p
     return pa.ipc.open_stream(resp.raw).read_all()
 
 
-def query_flight(location: str, req: QueryRequest) -> pa.Table:
-    """Discover the flight then DoGet the Arrow stream."""
-    import pyarrow.flight as flight  # lazy: not needed for HTTP-only use
-
-    client = flight.connect(location)
-    descriptor = flight.FlightDescriptor.for_command(json.dumps(req.to_dict()).encode())
-    info = client.get_flight_info(descriptor)
-    return client.do_get(info.endpoints[0].ticket).read_all()
-
-
 def list_datasets_http(base_url: str) -> dict:
+    """List datasets from the Swagger control plane (default :8000)."""
     return requests.get(f"{base_url.rstrip('/')}/datasets", timeout=30).json()
 
 
@@ -79,7 +83,8 @@ def _req_from_args(args: argparse.Namespace) -> QueryRequest:
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Query a kob server.")
-    p.add_argument("--transport", choices=["http", "flight"], default="http")
+    p.add_argument("--transport", choices=["flight", "http"], default="flight",
+                   help="flight = the fast default (:8815); http = the Arrow-over-HTTP demo (:8001).")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int)
     p.add_argument("--dataset", required=True)
@@ -93,10 +98,10 @@ def main(argv: list[str] | None = None) -> None:
 
     req = _req_from_args(args)
     t0 = time.perf_counter()
-    if args.transport == "http":
-        table = query_http(f"http://{args.host}:{args.port or 8000}", req, compression=args.compression)
-    else:
+    if args.transport == "flight":
         table = query_flight(f"grpc://{args.host}:{args.port or 8815}", req)
+    else:
+        table = query_http(f"http://{args.host}:{args.port or 8001}", req, compression=args.compression)
     dt = time.perf_counter() - t0
 
     print(f"transport={args.transport}  rows={table.num_rows:,}  cols={table.num_columns}  "

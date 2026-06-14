@@ -1,102 +1,42 @@
-"""kob — minimal, self-discovering Parquet read server (Arrow IPC over HTTP).
+"""kob — the Swagger HTTP control plane that runs alongside the Arrow Flight server.
 
-A producer drops Parquet under ``KOB_DATA_ROOT``; kob discovers it and serves it.
-Tiny dependency surface (DuckDB + PyArrow + FastAPI), zero hardcoded schema.
+This small FastAPI app is the **human-facing** surface of kob. It is *not* the fast data
+path — that is Arrow Flight (see :mod:`kob.server.flight`). It exists so you can, from a
+browser at ``/docs``:
 
-Discovery
-    ``GET  /health``                O(1) liveness (never walks the data tree).
-    ``GET  /datasets``              list discovered datasets (folders of Parquet).
-    ``GET  /datasets/{name}``       partition columns (+values, the "filter per folder"
-                                    options) and data columns (+types).
-    ``GET  /datasets/{name}/facets``  per-column min/max (+ optional distinct) — the
-                                    "filter per column" options. ``?columns=a,b&distinct=true``
-
-Query
-    ``POST /query``                 run a query; body is the JSON contract. Streams Arrow
-                                    IPC. ``?format=arrow|csv|json`` (default arrow),
-                                    ``?compression=zstd|lz4|none`` (default zstd).
+* **discover** datasets and the filters available *per folder* (partitions) and *per
+  column* (min/max/distinct);
+* read **how to pull data over Flight** (``GET /flight``);
+* **try a query interactively** (``POST /query``), which returns JSON or CSV — handy for
+  exploration, debugging and spreadsheet/interop, never the throughput path.
 
 Everything is read-only. Column/operator names are validated against the discovered
 schema and all values are bound parameters, so untrusted clients cannot inject SQL.
-
-Interactive docs: Swagger UI at ``/docs``, ReDoc at ``/redoc``, schema at ``/openapi.json``.
 """
 
 from __future__ import annotations
 
-import argparse
-import io
 import json
-import os
-import queue
-import threading
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.csv as pacsv
-import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import engine
-from .catalog import DATA_ROOT, get_dataset, list_datasets
-from .contract import QueryRequest
+from ..core import engine
+from ..core.catalog import DATA_ROOT, get_dataset, list_datasets
+from ..core.contract import QueryRequest
 
-ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
+DEFAULT_FLIGHT_LOCATION = "grpc://127.0.0.1:8815"
 
 
 # --------------------------------------------------------------------------- #
-# Arrow IPC streaming.
-#
-# A background producer thread writes batches into a small queue while the response
-# generator drains it — so DuckDB scans batch N+1 while batch N is on the wire
-# (pipelining), with the bounded queue providing backpressure.
+# Interop result encoders (JSON / CSV). The binary fast path is Flight, not this.
 # --------------------------------------------------------------------------- #
-class _QueueFile(io.RawIOBase):
-    def __init__(self, q: "queue.Queue[bytes | None]") -> None:
-        self._q = q
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, b) -> int:  # type: ignore[override]
-        self._q.put(bytes(b))
-        return len(b)
-
-
-def _stream_arrow(reader: pa.RecordBatchReader, compression: str | None):
-    comp = None if compression in (None, "none", "") else compression
-    opts = pa.ipc.IpcWriteOptions(compression=comp)
-    q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=16)
-
-    def produce() -> None:
-        try:
-            sink = pa.output_stream(_QueueFile(q))
-            writer = pa.ipc.new_stream(sink, reader.schema, options=opts)
-            for batch in reader:
-                writer.write_batch(batch)
-                sink.flush()
-            writer.close()
-            sink.close()
-        except Exception:  # noqa: BLE001 — a truncated stream signals the error to the client
-            pass
-        q.put(None)
-
-    threading.Thread(target=produce, daemon=True).start()
-
-    def consume():
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            yield item
-
-    return consume()
-
-
 def _stream_json(reader: pa.RecordBatchReader):
-    """Row-JSON debug/interop path — intentionally simple, never the fast path."""
+    """Row-JSON for browsers/interop — intentionally simple, never the fast path."""
     yield b"["
     first = True
     for batch in reader:
@@ -118,7 +58,7 @@ def _csv_bytes(reader: pa.RecordBatchReader) -> bytes:
 # --------------------------------------------------------------------------- #
 class FilterModel(BaseModel):
     column: str = Field(..., description="A data column or a partition (folder) key.", examples=["region"])
-    op: str = Field("=", description="One of: = != < <= > >= in 'not in' like ilike", examples=["in"])
+    op: str = Field("=", description="One of: = != <> < <= > >= in 'not in' like 'not like' ilike", examples=["in"])
     value: Any = Field(..., description="A scalar, or a list for in / not in.", examples=[["eu", "us"]])
 
 
@@ -147,26 +87,30 @@ class QueryModel(BaseModel):
 _API_DESCRIPTION = """\
 **kob** — a tiny, self-discovering, read-only Parquet query service.
 
-A producer drops Parquet under `KOB_DATA_ROOT`; kob discovers datasets, partitions
-and columns automatically and serves results as **Apache Arrow** (or CSV/JSON).
+A producer drops Parquet under `KOB_DATA_ROOT`; kob discovers datasets, partitions and
+columns automatically. The **fast, default data path is Apache Arrow Flight** (gRPC) —
+see `GET /flight`. This HTTP API is for **discovery and interactive exploration**:
 
 - **Discovery** — list datasets, inspect partitions (filter *per folder*) and columns (filter *per column*).
-- **Query** — `POST /query` with the JSON contract; streams Arrow IPC.
+- **Flight** — `GET /flight` documents how to pull results over Arrow Flight (the throughput path).
+- **Query (interactive)** — `POST /query` runs a query and returns **JSON or CSV** for browsing/interop.
+  For large or latency-sensitive pulls, use Flight instead.
 """
 
 _OPENAPI_TAGS = [
     {"name": "Discovery", "description": "Find datasets and the filters available per folder and per column."},
-    {"name": "Query", "description": "Run a read-only query and stream the result as Arrow / CSV / JSON."},
+    {"name": "Flight", "description": "How to pull results over the fast Arrow Flight (gRPC) transport."},
+    {"name": "Query", "description": "Run a read-only query interactively (JSON / CSV). Flight is the fast path."},
 ]
 
 
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
-def create_app() -> FastAPI:
+def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
     app = FastAPI(
         title="kob",
-        version="0.3.0",
+        version="0.4.0",
         description=_API_DESCRIPTION,
         openapi_tags=_OPENAPI_TAGS,
     )
@@ -175,7 +119,8 @@ def create_app() -> FastAPI:
     def health() -> dict:
         # Deliberately no discovery here: health probes fire constantly and must
         # never pay a tree walk. /datasets is the discovery endpoint.
-        return {"status": "ok", "data_root": str(DATA_ROOT), "data_root_exists": DATA_ROOT.is_dir()}
+        return {"status": "ok", "data_root": str(DATA_ROOT), "data_root_exists": DATA_ROOT.is_dir(),
+                "flight": flight_location}
 
     @app.get("/datasets", tags=["Discovery"], summary="List discovered datasets")
     def datasets(refresh: bool = False) -> dict:
@@ -219,19 +164,38 @@ def create_app() -> FastAPI:
             out.update(engine.column_facets(name, data_cols, distinct=distinct))
         return {"dataset": name, "facets": out}
 
+    @app.get("/flight", tags=["Flight"], summary="How to pull results over Arrow Flight (the fast path)")
+    def flight_info() -> dict:
+        example = QueryModel.model_config["json_schema_extra"]["examples"][0]
+        return {
+            "location": flight_location,
+            "transport": "Apache Arrow Flight (gRPC + Arrow IPC) — the recommended, fastest data path.",
+            "how_to": [
+                "1. Connect a Flight client to `location`.",
+                "2. Build a FlightDescriptor.for_command(json) where json is the same query "
+                "contract as POST /query (see the example below).",
+                "3. get_flight_info(descriptor) → endpoints[0].ticket, then do_get(ticket) to "
+                "stream Arrow RecordBatches. Or build a Ticket from the JSON directly.",
+            ],
+            "example_command": example,
+            "python": (
+                "from kob.tools.client import query_flight; "
+                "from kob.core.contract import QueryRequest, Filter; "
+                f"query_flight('{flight_location}', QueryRequest(dataset='events'))"
+            ),
+        }
+
     @app.post(
         "/query",
         tags=["Query"],
-        summary="Run a query; stream Arrow (or CSV/JSON)",
+        summary="Run a query interactively; return JSON (default) or CSV",
         responses={200: {"description": "Result rows in the requested format.",
-                         "content": {ARROW_STREAM_MIME: {}, "text/csv": {}, "application/json": {}}}},
+                         "content": {"application/json": {}, "text/csv": {}}}},
     )
     async def query(
         body: QueryModel,
-        format: str = Query("arrow", pattern="^(arrow|json|csv)$",
-                            description="arrow streams Arrow IPC; csv/json for interop/debug."),
-        compression: str = Query("zstd", pattern="^(zstd|lz4|none)$",
-                                 description="Arrow IPC buffer compression (zstd over a network, none on a LAN)."),
+        format: str = Query("json", pattern="^(json|csv)$",
+                            description="json (default) or csv. For binary/throughput, use Arrow Flight."),
     ):
         try:
             req = QueryRequest.from_dict(body.model_dump())
@@ -241,40 +205,13 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
 
-        if format == "arrow":
-            return StreamingResponse(
-                _stream_arrow(reader, compression),
-                media_type=ARROW_STREAM_MIME,
-                headers={"X-KOB-Compression": compression},
-            )
-        if format == "json":
-            return StreamingResponse(_stream_json(reader), media_type="application/json")
-        return Response(content=_csv_bytes(reader), media_type="text/csv")
+        if format == "csv":
+            return Response(content=_csv_bytes(reader), media_type="text/csv")
+        return StreamingResponse(_stream_json(reader), media_type="application/json")
 
     return app
 
 
+# A default app (Flight location at its default port) so `uvicorn kob.server.api:app`
+# works; the `kob` entry point (kob.server.app) injects the real Flight location.
 app = create_app()
-
-
-def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="kob — minimal self-discovering Parquet read server (Arrow/HTTP).")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--workers", type=int, default=1,
-                   help="Uvicorn worker processes (each gets its own DuckDB).")
-    p.add_argument("--threads", type=int, default=0,
-                   help="DuckDB threads per worker (0 = all cores).")
-    args = p.parse_args(argv)
-    if args.threads:
-        os.environ["KOB_DUCKDB_THREADS"] = str(args.threads)
-    if args.workers > 1:
-        # Multi-process serving needs the app as an import string.
-        uvicorn.run("kob.server_http:app", host=args.host, port=args.port,
-                    workers=args.workers, log_level="info")
-    else:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-
-
-if __name__ == "__main__":
-    main()

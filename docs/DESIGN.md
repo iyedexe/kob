@@ -60,10 +60,13 @@ on this data — and the gap grows with result size.
 
 ## Transports
 
-The **default** server is Arrow IPC over plain HTTP — minimal infra, works through any proxy/gateway,
-trivially debuggable. Arrow **Flight** (gRPC) ships as an optional server for maximum throughput,
-parallel/streaming pulls, or many concurrent clients. Both share the same discovery, contract and
-DuckDB engine — the only difference is the wire.
+The **default** `kob` server runs Arrow **Flight** (gRPC) — the fastest transport, whose wire payload
+*is* the Arrow columnar layout (nothing to deserialize) — alongside a small **Swagger HTTP** control
+plane for discovery and interactive exploration. Both share one process, one discovery cache and one
+DuckDB engine; the data path stays pure Flight while the HTTP side serves discovery and a JSON/CSV
+`POST /query` for browsers and interop. Arrow-IPC-over-HTTP, REST/JSON and gRPC/Protobuf remain as
+standalone **demo** servers under `kob/demos/` — they exist to demonstrate the alternatives and to
+give the benchmark something to beat, not for production use.
 
 ## The query engine: DuckDB
 
@@ -88,6 +91,6 @@ The C# client in `clients/csharp/` handles all four points.
 ## Scope notes
 
 - Real FactSet GeoRev / OptionMetrics are proprietary; this repo ships a generator that
-  fabricates same-shape data (see `generate_data.py`), so it is freely redistributable.
+  fabricates same-shape data (see `kob/tools/generate_data.py`), so it is freely redistributable.
 - Read-only by design: there is no write/ingest path, which keeps the server lightweight and
   means the C# Flight SQL write-side gaps (transactions/savepoints/Substrait) are irrelevant.

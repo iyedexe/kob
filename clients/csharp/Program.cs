@@ -5,7 +5,7 @@
 //   * Option A — Arrow Flight (gRPC)   (Apache.Arrow.Flight FlightClient)
 //
 // Build & run:
-//   dotnet run --project clients/csharp -- --transport both --dataset optionmetrics --underlying AAPL --year 2023
+//   dotnet run --project clients/csharp -- --transport flight --dataset optionmetrics --underlying AAPL --year 2023
 //
 // Key .NET gotchas handled here:
 //   * LZ4/ZSTD IPC needs the separate Apache.Arrow.Compression package + a
@@ -137,9 +137,9 @@ class Program
 
 record Options
 {
-    public string Transport = "both";
+    public string Transport = "flight";
     public string Host = "127.0.0.1";
-    public int HttpPort = 8000;
+    public int HttpPort = 8001;
     public int FlightPort = 8815;
     public string Dataset = "optionmetrics";
     public string? Underlying = "AAPL";

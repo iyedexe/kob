@@ -32,7 +32,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from scipy.stats import norm
 
-from .catalog import DATA_ROOT
+from ..core.catalog import DATA_ROOT
 
 # --------------------------------------------------------------------------- #
 # Reference dimensions

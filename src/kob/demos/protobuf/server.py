@@ -21,8 +21,8 @@ from concurrent import futures
 import grpc
 import pyarrow as pa
 
-from . import engine
-from .contract import QueryRequest
+from ...core import engine
+from ...core.contract import QueryRequest
 from .proto import data_service_pb2 as pb
 from .proto import data_service_pb2_grpc as pbg
 

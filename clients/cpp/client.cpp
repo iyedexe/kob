@@ -8,7 +8,7 @@
 // bottle is built with the codecs), so no extra setup is needed on the read path.
 //
 // Build:  see clients/cpp/CMakeLists.txt
-// Run:    ./arrow_client --transport both --dataset optionmetrics --underlying AAPL --year 2023
+// Run:    ./arrow_client --transport flight --dataset optionmetrics --underlying AAPL --year 2023
 
 #include <chrono>
 #include <iostream>
@@ -157,9 +157,9 @@ arrow::Status Run(int argc, char** argv) {
     return it == args.end() ? d : it->second;
   };
 
-  std::string transport = get("--transport", "both");
+  std::string transport = get("--transport", "flight");
   std::string host = get("--host", "127.0.0.1");
-  int http_port = std::stoi(get("--http-port", "8000"));
+  int http_port = std::stoi(get("--http-port", "8001"));
   int flight_port = std::stoi(get("--flight-port", "8815"));
   std::string compression = get("--compression", "zstd");
 

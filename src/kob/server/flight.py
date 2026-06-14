@@ -1,13 +1,17 @@
-"""kob — optional Apache Arrow Flight server (gRPC + Arrow IPC).
+"""kob — Apache Arrow **Flight** server (gRPC + Arrow IPC). The primary, fastest transport.
 
-A Flight client discovers datasets with ``list_flights`` / ``get_flight_info`` and
-pulls Arrow record batches with ``do_get``. The Flight wire payload *is* the Arrow
-columnar layout, so there is no serialize/deserialize step — the server streams the
-same batches DuckDB produces straight onto gRPC.
+A Flight client discovers datasets with ``list_flights`` / ``get_flight_info`` and pulls
+Arrow record batches with ``do_get``. The Flight wire payload *is* the Arrow columnar
+layout, so there is no serialize/deserialize step — the server streams the same batches
+DuckDB produces straight onto gRPC.
 
-The :class:`~kob.contract.QueryRequest` JSON is carried as the Flight *command*
+The :class:`~kob.core.contract.QueryRequest` JSON is carried as the Flight *command*
 (in the descriptor) and echoed back as the *ticket*, so a client can either call
 ``get_flight_info`` first or build a ticket directly.
+
+This module is started for you by the primary ``kob`` server (:mod:`kob.server.app`),
+alongside the Swagger control plane. ``python -m kob.server.flight`` runs Flight on its
+own (no HTTP) — handy for benchmarking the raw transport.
 """
 
 from __future__ import annotations
@@ -18,9 +22,9 @@ import os
 
 import pyarrow.flight as flight
 
-from . import engine
-from .catalog import list_datasets
-from .contract import QueryRequest
+from ..core import engine
+from ..core.catalog import list_datasets
+from ..core.contract import QueryRequest
 
 
 class ParquetFlightServer(flight.FlightServerBase):
@@ -68,8 +72,18 @@ class ParquetFlightServer(flight.FlightServerBase):
         return flight.RecordBatchStream(reader)
 
 
+def build_server(host: str, port: int,
+                 batch_rows: int = engine.DEFAULT_BATCH_ROWS) -> tuple[ParquetFlightServer, str]:
+    """Construct (but don't serve) the Flight server. Returns ``(server, location)``.
+
+    The primary ``kob`` app calls this and runs ``server.serve()`` on a background thread.
+    """
+    location = f"grpc://{host}:{port}"
+    return ParquetFlightServer(location, batch_rows), location
+
+
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="kob — Arrow Flight data server (optional, max throughput).")
+    p = argparse.ArgumentParser(description="kob — Arrow Flight data server (the fast path, run standalone).")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8815)
     p.add_argument("--threads", type=int, default=0, help="DuckDB threads (0 = all cores).")
@@ -77,8 +91,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.threads:
         os.environ["KOB_DUCKDB_THREADS"] = str(args.threads)
-    location = f"grpc://{args.host}:{args.port}"
-    server = ParquetFlightServer(location)
+    server, location = build_server(args.host, args.port)
     print(f"kob Flight server listening on {location}")
     server.serve()
 

@@ -6,23 +6,30 @@ One-page orientation for picking this project back up (human or AI assistant).
 
 **kob** — a tiny, self-discovering, read-only Parquet query server. A producer
 microservice drops Hive-partitioned Parquet under `KOB_DATA_ROOT`; kob auto-discovers
-datasets/partitions/columns and serves filtered queries as Apache Arrow over HTTP
-(default) or Arrow Flight (optional). Repo: `git@github.com:iyedexe/kob.git`.
+datasets/partitions/columns and serves filtered queries as Apache Arrow. The default
+`kob` command runs **Arrow Flight** (gRPC, the fast data path) alongside a **Swagger**
+HTTP control plane for discovery/exploration. Repo: `git@github.com:iyedexe/kob.git`.
 
 ## Layout
 
 ```
 src/kob/
-  catalog.py        filesystem auto-discovery + TTL cache + path sandbox
-  contract.py       the JSON query contract -> parameterised DuckDB SQL
-  engine.py         DuckDB -> streaming Arrow RecordBatchReader (the hot path)
-  server_http.py    THE product: FastAPI app, discovery + /query, Swagger at /docs
-  server_flight.py  optional Arrow Flight (gRPC) transport
-  client.py         [client] reference Python client (HTTP + Flight)
-  generate_data.py  [gen] synthetic GeoRev/OptionMetrics sample datasets
-  benchmark.py      [bench] 6-method transport shoot-out -> docs/BENCHMARKS.md
-  server_proto.py   [bench] gRPC/Protobuf baseline (exists to lose benchmarks fairly)
-  proto/            generated protobuf stubs for the baseline
+  core/            the product (no web/RPC code)
+    catalog.py       filesystem auto-discovery + TTL cache + path sandbox
+    contract.py      the JSON query contract -> parameterised DuckDB SQL
+    engine.py        DuckDB -> streaming Arrow RecordBatchReader (the hot path)
+  server/          the `kob` entry point (Flight + Swagger, started together)
+    flight.py        Arrow Flight (gRPC) — the fast, default data path
+    api.py           FastAPI: Swagger UI, discovery, /flight how-to, interactive /query
+    app.py           main(): Flight on a thread + the Swagger app in the foreground
+  demos/           secondary transports — exist only to lose benchmarks fairly
+    arrow_http/      Arrow IPC over plain HTTP
+    json/            REST/JSON baseline
+    protobuf/        [bench] gRPC/Protobuf baseline + generated proto stubs
+  tools/           optional utilities (each needs its extra)
+    generate_data.py [gen] synthetic GeoRev/OptionMetrics sample datasets
+    client.py        [client] reference Python client (Flight + HTTP)
+    benchmark.py     [bench] 6-method transport shoot-out -> docs/BENCHMARKS.md
 clients/            C# (.NET), C++ (Arrow+libcurl), Excel (PowerQuery/xlwings) clients
 docs/               DESIGN.md (rationale) · PERFORMANCE_REPORT.md (5-way bench) · BENCHMARKS.md (raw)
 data/               local sample Parquet (gitignored, never committed) — regenerate with kob-gen
@@ -33,7 +40,7 @@ data/               local sample Parquet (gitignored, never committed) — regen
 ```bash
 uv sync --extra all                 # everything (server core needs no extras)
 uv run kob-gen --scale small        # sample data into ./data
-uv run kob                          # serve :8000 — Swagger at /docs
+uv run kob                          # Flight :8815 + Swagger http://localhost:8000/docs
 uv run kob-client --dataset optionmetrics --filter 'underlying:=:AAPL' --limit 5
 uv run kob-bench --scale small      # full transport benchmark (spawns servers itself)
 ```
@@ -51,8 +58,9 @@ C++ client: `cmake -S clients/cpp -B clients/cpp/build -DCMAKE_PREFIX_PATH=$(bre
 3. **Discovery over configuration** — datasets/partitions/columns come from the
    filesystem (folder names + one Parquet footer), TTL-cached (`KOB_DISCOVERY_TTL`).
    No catalog file, ever.
-4. **HTTP is the default transport; Flight is optional** — HTTP+Arrow ≈ 90% of Flight
-   throughput with none of the gRPC infra friction.
+4. **Flight is the default transport (fastest); Swagger runs alongside it** — `kob`
+   starts Arrow Flight (data) + a Swagger HTTP control plane (discovery/exploration) in
+   one process. HTTP-Arrow / JSON / Protobuf survive only as demos under `kob/demos/`.
 5. **Core stays at 4 deps** — anything else (numpy/pandas/grpc/...) lives in extras.
 6. **Read-only by design** — no write path; auth/TLS delegated to a fronting proxy.
 

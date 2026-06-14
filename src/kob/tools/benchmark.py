@@ -1,12 +1,12 @@
 """Head-to-head benchmark: Arrow Flight vs Arrow-IPC-over-HTTP vs Protobuf vs JSON.
 
-By default it spawns all three servers as subprocesses, runs a set of representative
-queries (bulk + pushdown) over whichever data you generated, and prints a comparison
-of wall-clock latency, wire payload size and throughput. Use ``--no-spawn`` to point
-at servers you started yourself.
+By default it spawns all four servers as subprocesses (Flight, Arrow-over-HTTP, JSON,
+Protobuf), runs a set of representative queries (bulk + pushdown) over whichever data you
+generated, and prints a comparison of wall-clock latency, wire payload size and
+throughput. Use ``--no-spawn`` to point at servers you started yourself.
 
     uv run --extra bench kob-bench --scale small
-    uv run --extra bench kob-bench --reps 5 --http-port 8000 --flight-port 8815
+    uv run --extra bench kob-bench --reps 5 --arrow-port 8001 --flight-port 8815
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ import pyarrow as pa
 import pyarrow.flight as flight
 import requests
 
-from .contract import Filter, QueryRequest
-from .proto import data_service_pb2 as pb
-from .proto import data_service_pb2_grpc as pbg
+from ..core.contract import Filter, QueryRequest
+from ..demos.protobuf.proto import data_service_pb2 as pb
+from ..demos.protobuf.proto import data_service_pb2_grpc as pbg
 
 _GRPC_MAX = 512 * 1024 * 1024
 
@@ -91,7 +91,7 @@ class _CountingReader(io.RawIOBase):
 
 
 def fetch_http_arrow(base: str, req: QueryRequest, compression: str):
-    resp = requests.post(f"{base}/query", params={"format": "arrow", "compression": compression},
+    resp = requests.post(f"{base}/query", params={"compression": compression},
                          json=req.to_dict(), stream=True, timeout=600)
     resp.raise_for_status()
     resp.raw.decode_content = True
@@ -101,8 +101,7 @@ def fetch_http_arrow(base: str, req: QueryRequest, compression: str):
 
 
 def fetch_http_json(base: str, req: QueryRequest):
-    resp = requests.post(f"{base}/query", params={"format": "json"},
-                         json=req.to_dict(), stream=True, timeout=600)
+    resp = requests.post(f"{base}/query", json=req.to_dict(), stream=True, timeout=600)
     resp.raise_for_status()
     payload = resp.content
     rows = json.loads(payload)
@@ -166,7 +165,7 @@ def _wait_http(base: str, timeout: float = 30.0) -> None:
     raise TimeoutError(f"HTTP server {base} did not become healthy")
 
 
-def spawn_servers(host, http_port, flight_port, proto_port, threads):
+def spawn_servers(host, arrow_port, json_port, flight_port, proto_port, threads):
     def launch(module, port):
         return subprocess.Popen(
             [sys.executable, "-m", module, "--host", host, "--port", str(port),
@@ -174,11 +173,13 @@ def spawn_servers(host, http_port, flight_port, proto_port, threads):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     procs = [
-        launch("kob.server_http", http_port),
-        launch("kob.server_flight", flight_port),
-        launch("kob.server_proto", proto_port),
+        launch("kob.server.flight", flight_port),
+        launch("kob.demos.arrow_http.server", arrow_port),
+        launch("kob.demos.json.server", json_port),
+        launch("kob.demos.protobuf.server", proto_port),
     ]
-    _wait_http(f"http://{host}:{http_port}")
+    _wait_http(f"http://{host}:{arrow_port}")
+    _wait_http(f"http://{host}:{json_port}")
     _wait_tcp(host, flight_port)
     _wait_tcp(host, proto_port)
     time.sleep(0.5)  # gRPC servers need a beat after the port opens
@@ -207,7 +208,8 @@ def _fmt_mb(n):
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Benchmark Flight vs HTTP-Arrow vs JSON.")
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--http-port", type=int, default=8000)
+    p.add_argument("--arrow-port", type=int, default=8001, help="Arrow-IPC-over-HTTP demo port.")
+    p.add_argument("--json-port", type=int, default=8002, help="REST/JSON demo port.")
     p.add_argument("--flight-port", type=int, default=8815)
     p.add_argument("--proto-port", type=int, default=8816)
     p.add_argument("--threads", type=int, default=4)
@@ -219,24 +221,26 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", help="Optional path to write a Markdown report.")
     args = p.parse_args(argv)
 
-    base = f"http://{args.host}:{args.http_port}"
+    base_arrow = f"http://{args.host}:{args.arrow_port}"
+    base_json = f"http://{args.host}:{args.json_port}"
     loc = f"grpc://{args.host}:{args.flight_port}"
 
     procs: list = []
     if not args.no_spawn:
         print("Spawning servers ...")
-        procs = spawn_servers(args.host, args.http_port, args.flight_port, args.proto_port, args.threads)
+        procs = spawn_servers(args.host, args.arrow_port, args.json_port,
+                              args.flight_port, args.proto_port, args.threads)
 
     host = args.host
     proto_port = args.proto_port
     # Ordered fastest-expected first; rest_json is the baseline.
     methods = [
         ("flight", lambda req: fetch_flight(loc, req)),
-        ("http_arrow_zstd", lambda req: fetch_http_arrow(base, req, "zstd")),
-        ("http_arrow_none", lambda req: fetch_http_arrow(base, req, "none")),
+        ("http_arrow_zstd", lambda req: fetch_http_arrow(base_arrow, req, "zstd")),
+        ("http_arrow_none", lambda req: fetch_http_arrow(base_arrow, req, "none")),
         ("proto_columnar", lambda req: fetch_proto(host, proto_port, req, "columnar")),
         ("proto_row", lambda req: fetch_proto(host, proto_port, req, "row")),
-        ("rest_json", lambda req: fetch_http_json(base, req)),
+        ("rest_json", lambda req: fetch_http_json(base_json, req)),
     ]
     # The row-oriented baselines are slow — measure them once, no warmup.
     slow_methods = {"rest_json", "proto_row"}

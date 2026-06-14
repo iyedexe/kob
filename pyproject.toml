@@ -1,12 +1,12 @@
 [project]
 name = "kob"
-version = "0.3.0"
-description = "kob — a tiny, self-discovering, read-only Parquet query server. Drop Parquet in a folder; query it as Arrow, blazing fast."
+version = "0.4.0"
+description = "kob — a tiny, self-discovering, read-only Parquet query server. Drop Parquet in a folder; serve it as Apache Arrow over Flight (fast) with a Swagger UI."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
 
-# Core server: tiny surface — DuckDB engine + Arrow + a thin ASGI layer. Nothing else.
+# Core server: tiny surface — DuckDB engine + Arrow Flight + a thin ASGI/Swagger layer. Nothing else.
 dependencies = [
     "duckdb>=1.5.3",
     "pyarrow>=24.0.0",
@@ -25,14 +25,17 @@ bench = ["requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7"]
 all = ["numpy>=2.0", "scipy>=1.13", "pandas>=2.2", "requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7"]
 
 [project.scripts]
-# The product (core install is enough):
-kob = "kob.server_http:main"                 # the server: kob --port 8000
-kob-flight = "kob.server_flight:main"        # optional Arrow Flight transport
+# The product — a core install is all you need (Arrow Flight + Swagger, together):
+kob = "kob.server.app:main"                      # the server: Flight :8815 + Swagger :8000/docs
+kob-flight = "kob.server.flight:main"            # Flight only, standalone (e.g. for benchmarking)
+# Demo transports — secondary, here only to illustrate the wire-format alternatives:
+kob-demo-arrow = "kob.demos.arrow_http.server:main"  # Arrow IPC over plain HTTP
+kob-demo-json = "kob.demos.json.server:main"         # REST/JSON baseline
+kob-demo-proto = "kob.demos.protobuf.server:main"    # [bench]  gRPC/Protobuf baseline
 # Tooling (needs the matching extra):
-kob-gen = "kob.generate_data:main"           # [gen]    sample datasets
-kob-client = "kob.client:main"               # [client] reference client
-kob-bench = "kob.benchmark:main"             # [bench]  transport shoot-out
-kob-proto = "kob.server_proto:main"          # [bench]  gRPC/Protobuf baseline
+kob-gen = "kob.tools.generate_data:main"         # [gen]    sample datasets
+kob-client = "kob.tools.client:main"             # [client] reference client
+kob-bench = "kob.tools.benchmark:main"           # [bench]  transport shoot-out
 
 [build-system]
 requires = ["hatchling"]
