@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+
+# Data: NEVER committed — kob discovers whatever you drop locally.
+# Regenerate samples with: uv run --extra gen kob-gen --scale small
+data/
+
+# .NET (C# client)
+clients/csharp/bin/
+clients/csharp/obj/
+
+# C++ client build
+clients/cpp/build/
+
+# Excel export artifacts
+clients/excel/excel_export.*
+
+# macOS
+.DS_Store

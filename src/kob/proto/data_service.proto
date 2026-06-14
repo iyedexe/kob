@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package ads;
+
+// The request reuses the JSON query contract (it is tiny — its encoding is irrelevant
+// to the benchmark, which measures *result* transfer). `encoding` selects how the
+// server serializes the result rows.
+message QueryRequest {
+  string request_json = 1;
+  string encoding = 2;        // "row" (row-oriented) or "columnar" (packed columns)
+}
+
+message Field {
+  string name = 1;
+  string type = 2;            // "double" | "int64" | "bool" | "string"
+}
+message Schema { repeated Field fields = 1; }
+
+// ---- Row-oriented encoding (the honest generic equivalent of a JSON row API) ----
+message Cell {
+  oneof v {
+    double d = 1;
+    sint64 i = 2;
+    string s = 3;
+    bool   b = 4;
+  }
+  // an unset oneof == NULL
+}
+message Row { repeated Cell cells = 1; }
+message RowBatch { repeated Row rows = 1; }
+
+// ---- Columnar encoding (protobuf "done right": packed scalar columns) ----
+message Column {
+  repeated double doubles = 1 [packed = true];
+  repeated sint64 ints    = 2 [packed = true];
+  repeated string strings = 3;
+  repeated bool   bools   = 4 [packed = true];
+}
+message ColumnarBatch {
+  repeated Column columns = 1;   // aligned with Schema.fields order
+  int32 num_rows = 2;
+}
+
+message QueryReply {
+  oneof payload {
+    Schema schema = 1;           // always the first message in the stream
+    RowBatch row_batch = 2;
+    ColumnarBatch col_batch = 3;
+  }
+}
+
+service DataService {
+  rpc Query(QueryRequest) returns (stream QueryReply);
+}
