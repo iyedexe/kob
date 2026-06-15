@@ -22,21 +22,24 @@ HERE = Path(__file__).resolve().parent
 ASSETS = HERE / "assets"
 ASSETS.mkdir(exist_ok=True)
 
-# ---- palette ----------------------------------------------------------------
-TEAL  = RGBColor(0x2A, 0x9D, 0x8F)
-NAVY  = RGBColor(0x26, 0x46, 0x53)
-INK   = RGBColor(0x1D, 0x2B, 0x3A)
-SAND  = RGBColor(0xE9, 0xC4, 0x66)
-SAND2 = RGBColor(0xF4, 0xA2, 0x61)
-ORANGE= RGBColor(0xE7, 0x6F, 0x51)
-GRAY  = RGBColor(0x8A, 0x94, 0x9E)
-LIGHT = RGBColor(0xF2, 0xF3, 0xF5)
-WHITE = RGBColor(0xFF, 0xFF, 0xFF)
-CODEBG= RGBColor(0x1E, 0x2A, 0x36)
-CODEFG= RGBColor(0xE6, 0xED, 0xF3)
+# ---- palette (purple / plum / magenta brand) --------------------------------
+PURPLE  = RGBColor(0x6D, 0x2C, 0x8F)   # primary brand purple
+PLUM    = RGBColor(0x3A, 0x16, 0x47)   # deep aubergine — dark backgrounds, titles, table headers
+MAGENTA = RGBColor(0xC7, 0x1E, 0x7A)   # vivid accent
+LAV     = RGBColor(0xA0, 0x5E, 0xB5)   # mid lavender
+LAV2    = RGBColor(0xC9, 0xA0, 0xDC)   # light lavender
+INK     = RGBColor(0x2B, 0x22, 0x30)   # body text
+GRAY    = RGBColor(0x8A, 0x86, 0x92)   # muted captions
+LIGHT   = RGBColor(0xF4, 0xF1, 0xF6)   # card background (light lavender-gray)
+WHITE   = RGBColor(0xFF, 0xFF, 0xFF)
+CODEBG  = RGBColor(0x2A, 0x16, 0x33)   # dark plum code box
+CODEFG  = RGBColor(0xEC, 0xE3, 0xF2)
+ONDARK  = RGBColor(0xE6, 0xD8, 0xEE)   # light text on dark plum
+ONDARKMUTE = RGBColor(0xB7, 0xA9, 0xC2)
+ACCENTL = RGBColor(0xCB, 0x9F, 0xE0)   # bright accent, readable on dark
 
-HEXES = {"TEAL": "#2a9d8f", "NAVY": "#264653", "SAND": "#e9c466",
-         "SAND2": "#f4a261", "ORANGE": "#e76f51"}
+CHART_LAT = ["#6d2c8f", "#8e44ad", "#a05eb5", "#c9a0dc", "#c71e7a"]
+CHART_SPD = ["#6d2c8f", "#8e44ad", "#a05eb5", "#c9a0dc"]
 
 # ============================================================================
 # Charts
@@ -47,9 +50,8 @@ def _ms(v):
 def chart_latency(path):
     labels = ["Arrow Flight", "Arrow IPC / HTTP", "Protobuf (columnar)", "Protobuf (row)", "REST / JSON"]
     vals   = [66.9, 71.5, 3741.2, 6475.6, 117128.9]   # ms, 1.75M-row pull (medium dataset)
-    colors = [HEXES["TEAL"], HEXES["NAVY"], HEXES["SAND"], HEXES["SAND2"], HEXES["ORANGE"]]
     fig, ax = plt.subplots(figsize=(8.8, 4.0), dpi=200)
-    bars = ax.barh(labels[::-1], vals[::-1], color=colors[::-1], height=0.62)
+    bars = ax.barh(labels[::-1], vals[::-1], color=CHART_LAT[::-1], height=0.62)
     ax.set_xscale("log")
     ax.set_xlim(40, 500000)
     ax.set_xlabel("end-to-end client latency (log scale) — lower is better", fontsize=9)
@@ -65,9 +67,8 @@ def chart_latency(path):
 def chart_speedup(path):
     labels = ["Arrow\nFlight", "Arrow IPC\nover HTTP", "Protobuf\ncolumnar", "Protobuf\nrow"]
     vals   = [1751, 1019, 31, 18]
-    colors = [HEXES["TEAL"], HEXES["NAVY"], HEXES["SAND"], HEXES["SAND2"]]
     fig, ax = plt.subplots(figsize=(8.6, 3.9), dpi=200)
-    bars = ax.bar(labels, vals, color=colors, width=0.62)
+    bars = ax.bar(labels, vals, color=CHART_SPD, width=0.62)
     ax.set_yscale("log"); ax.set_ylim(1, 4000)
     ax.set_ylabel("× faster than REST/JSON (log)", fontsize=9)
     for b, v in zip(bars, vals):
@@ -126,16 +127,16 @@ def render(tf, items):
 
 def slide(idx, title=None, kicker=None):
     s = prs.slides.add_slide(BLANK)
-    fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.16), Inches(7.5)), TEAL)  # brand bar
+    fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(0.16), Inches(7.5)), PURPLE)  # brand bar
     if title:
         if kicker:
             render(tbox(s, MX, Inches(0.36), CW, Inches(0.3)),
-                   [{"text": kicker.upper(), "size": 12, "bold": True, "color": TEAL}])
+                   [{"text": kicker.upper(), "size": 12, "bold": True, "color": MAGENTA}])
         render(tbox(s, MX, Inches(0.62), CW, Inches(0.7)),
-               [{"text": title, "size": 30, "bold": True, "color": NAVY}])
-        fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, MX, Inches(1.34), Inches(2.1), Pt(3)), TEAL)
+               [{"text": title, "size": 30, "bold": True, "color": PLUM}])
+        fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, MX, Inches(1.34), Inches(2.1), Pt(3)), PURPLE)
     render(tbox(s, MX, Inches(7.02), CW, Inches(0.32)),
-           [{"runs": [{"text": "kob", "bold": True, "color": TEAL, "size": 10},
+           [{"runs": [{"text": "kob", "bold": True, "color": PURPLE, "size": 10},
                       {"text": "  ·  self-discovering Parquet → Apache Arrow", "color": GRAY, "size": 10},
                       {"text": f"          {idx} / 9", "color": GRAY, "size": 10}]}])
     return s
@@ -149,14 +150,14 @@ def code_box(s, x, y, w, h, lines, size=12.5):
                 for ln in lines])
     return box
 
-def card(s, x, y, w, h, head, body, accent=TEAL):
+def card(s, x, y, w, h, head, body, accent=PURPLE):
     fill(s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, h), LIGHT)
     fill(s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, x, y, Inches(0.09), h), accent)
     tf = tbox(s, x + Inches(0.28), y + Inches(0.16), w - Inches(0.4), h - Inches(0.3))
-    render(tf, [{"text": head, "size": 16, "bold": True, "color": NAVY, "after": 4},
+    render(tf, [{"text": head, "size": 16, "bold": True, "color": PLUM, "after": 4},
                 {"text": body, "size": 12.5, "color": INK, "ls": 1.08}])
 
-def table(s, x, y, w, rows, col_w, head_fill=NAVY, row_h=Inches(0.42)):
+def table(s, x, y, w, rows, col_w, head_fill=PLUM, row_h=Inches(0.42)):
     n, m = len(rows), len(rows[0])
     gt = s.shapes.add_table(n, m, x, y, w, row_h * n).table
     for j, cw in enumerate(col_w):
@@ -178,20 +179,20 @@ def table(s, x, y, w, rows, col_w, head_fill=NAVY, row_h=Inches(0.42)):
 # Slide 1 — Title
 # ============================================================================
 s = prs.slides.add_slide(BLANK)
-fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.333), Inches(7.5)), NAVY)
-fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(5.55), Inches(13.333), Inches(0.10)), TEAL)
+fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.333), Inches(7.5)), PLUM)
+fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(5.55), Inches(13.333), Inches(0.10)), MAGENTA)
 render(tbox(s, Inches(0.9), Inches(1.7), Inches(11.5), Inches(1.6)),
        [{"text": "kob", "size": 96, "bold": True, "color": WHITE}])
 render(tbox(s, Inches(0.95), Inches(3.4), Inches(11.5), Inches(1.0)),
        [{"text": "A tiny, self-discovering Parquet query server — served as Apache Arrow, fast.",
-         "size": 26, "color": RGBColor(0xCF, 0xE3, 0xDF)}])
+         "size": 26, "color": ONDARK}])
 render(tbox(s, Inches(0.95), Inches(4.25), Inches(11.5), Inches(0.6)),
        [{"text": "Drop Parquet in a folder → a discoverable, filterable, blazing-fast Arrow API.",
-         "size": 16, "italic": True, "color": GRAY}])
+         "size": 16, "italic": True, "color": ONDARKMUTE}])
 render(tbox(s, Inches(0.95), Inches(5.85), Inches(11.5), Inches(0.6)),
        [{"runs": [{"text": "Apache Arrow Flight   ·   DuckDB   ·   FastAPI / Swagger          ",
-                   "size": 13, "color": RGBColor(0xCF, 0xE3, 0xDF)},
-                  {"text": "github.com/iyedexe/kob", "size": 13, "bold": True, "color": TEAL}]}])
+                   "size": 13, "color": ONDARK},
+                  {"text": "github.com/iyedexe/kob", "size": 13, "bold": True, "color": ACCENTL}]}])
 
 # ============================================================================
 # Slide 2 — Motivation
@@ -202,18 +203,18 @@ render(tbox(s, MX, Inches(1.55), CW, Inches(0.7)),
                  "to Python / C# / C++ / Excel clients. Every usual option is overkill or slow:",
          "size": 16, "color": INK, "ls": 1.1}])
 card(s, MX, Inches(2.5), Inches(3.75), Inches(1.9), "A warehouse / broker",
-     "Heavy infrastructure in front of what is already a queryable, columnar file format.", NAVY)
+     "Heavy infrastructure in front of what is already a queryable, columnar file format.", PURPLE)
 card(s, Inches(4.78), Inches(2.5), Inches(3.75), Inches(1.9), "A hand-written API",
-     "Declare a schema + catalog in code, then redeploy on every new dataset, partition or column.", SAND2)
+     "Declare a schema + catalog in code, then redeploy on every new dataset, partition or column.", LAV)
 card(s, Inches(8.81), Inches(2.5), Inches(3.75), Inches(1.9), "A JSON / Protobuf endpoint",
-     "Pays the serialization tax — Arrow's FAQ puts (de)serialization at 80–90% of compute cost.", ORANGE)
+     "Pays the serialization tax — Arrow's FAQ puts (de)serialization at 80–90% of compute cost.", MAGENTA)
 render(tbox(s, MX, Inches(4.85), CW, Inches(1.4)),
-       [{"runs": [{"text": "What we actually want:  ", "size": 17, "bold": True, "color": NAVY},
-                  {"text": "self-discovering", "size": 17, "bold": True, "color": TEAL},
+       [{"runs": [{"text": "What we actually want:  ", "size": 17, "bold": True, "color": PLUM},
+                  {"text": "self-discovering", "size": 17, "bold": True, "color": PURPLE},
                   {"text": " (no hardcoded schema)  ·  ", "size": 17, "color": INK},
-                  {"text": "minimal", "size": 17, "bold": True, "color": TEAL},
+                  {"text": "minimal", "size": 17, "bold": True, "color": PURPLE},
                   {"text": " (tiny footprint)  ·  ", "size": 17, "color": INK},
-                  {"text": "blazing fast", "size": 17, "bold": True, "color": TEAL},
+                  {"text": "blazing fast", "size": 17, "bold": True, "color": PURPLE},
                   {"text": " (no serialization tax).", "size": 17, "color": INK}], "after": 8}])
 
 # ============================================================================
@@ -224,10 +225,10 @@ render(tbox(s, MX, Inches(1.55), CW, Inches(0.7)),
        [{"text": "Point it at a directory; it discovers your datasets, tells clients what they can filter "
                  "on per folder and per column, and streams results as Apache Arrow. ~750 lines of core server.",
          "size": 16, "color": INK, "ls": 1.1}])
-cards = [("Tiny", "Four dependencies — DuckDB, PyArrow, FastAPI, uvicorn. No DB, no broker, no config, no schema.", TEAL),
-         ("Self-configuring", "Drop new files / partitions / datasets — they appear live. Discovery reads folder names + one file's metadata; never scans data.", NAVY),
-         ("Fast", "DuckDB pushes partition/predicate/projection pruning into the scan; results stream as Arrow over Flight — nothing to deserialize.", SAND2),
-         ("Safe", "Read-only. Dataset names sandboxed to the root; columns/ops validated; every value a bound parameter (no SQL injection).", ORANGE)]
+cards = [("Tiny", "Four dependencies — DuckDB, PyArrow, FastAPI, uvicorn. No DB, no broker, no config, no schema.", PURPLE),
+         ("Self-configuring", "Drop new files / partitions / datasets — they appear live. Discovery reads folder names + one file's metadata; never scans data.", MAGENTA),
+         ("Fast", "DuckDB pushes partition/predicate/projection pruning into the scan; results stream as Arrow over Flight — nothing to deserialize.", LAV),
+         ("Safe", "Read-only. Dataset names sandboxed to the root; columns/ops validated; every value a bound parameter (no SQL injection).", PLUM)]
 xs = [MX, Inches(6.7)]
 ys = [Inches(2.55), Inches(4.55)]
 for k, (h, b, a) in enumerate(cards):
@@ -238,7 +239,7 @@ for k, (h, b, a) in enumerate(cards):
 # ============================================================================
 s = slide(4, "Why Apache Arrow — the 30-second theory", kicker="Theory")
 render(tbox(s, MX, Inches(1.55), Inches(6.3), Inches(4.6)),
-       [{"text": "Row vs. columnar is the whole story:", "size": 16, "bold": True, "color": NAVY, "after": 10},
+       [{"text": "Row vs. columnar is the whole story:", "size": 16, "bold": True, "color": PLUM, "after": 10},
         {"bullet": "dot", "text": "JSON & Protobuf are row-oriented. The sender encodes every value "
                                   "field-by-field; the receiver decodes every value and rebuilds columns.", "size": 14.5, "after": 8, "ls": 1.1},
         {"bullet": "dot", "text": "Cost scales with rows × cols — and grows super-linearly with result size.", "size": 14.5, "after": 8, "ls": 1.1},
@@ -254,7 +255,7 @@ table(s, Inches(7.35), Inches(2.0), Inches(5.2),
        ["Arrow Flight", "columnar + gRPC", "the default"]],
       col_w=[Inches(1.9), Inches(1.9), Inches(1.4)])
 render(tbox(s, Inches(7.35), Inches(4.95), Inches(5.2), Inches(1.2)),
-       [{"text": "“(De)serialization can represent 80–90% of computing costs.”", "size": 13.5, "italic": True, "color": NAVY, "after": 3},
+       [{"text": "“(De)serialization can represent 80–90% of computing costs.”", "size": 13.5, "italic": True, "color": PLUM, "after": 3},
         {"text": "— Apache Arrow FAQ. That is exactly the cost Arrow removes.", "size": 12, "color": GRAY}])
 
 # ============================================================================
@@ -262,7 +263,7 @@ render(tbox(s, Inches(7.35), Inches(4.95), Inches(5.2), Inches(1.2)),
 # ============================================================================
 s = slide(5, "Architecture: Flight + Swagger, one command", kicker="How it works")
 render(tbox(s, MX, Inches(1.5), Inches(6.2), Inches(4.5)),
-       [{"text": "One straight line, folder → Arrow stream:", "size": 15, "bold": True, "color": NAVY, "after": 8},
+       [{"text": "One straight line, folder → Arrow stream:", "size": 15, "bold": True, "color": PLUM, "after": 8},
         {"bullet": "dot", "text": "core — discover (catalog), validate the query (contract), execute on DuckDB → Arrow (engine).", "size": 13.5, "after": 6, "ls": 1.08},
         {"bullet": "dot", "text": "server — the kob entry point: Flight + a Swagger HTTP control plane, one process, one engine.", "size": 13.5, "after": 6, "ls": 1.08},
         {"bullet": "dot", "text": "demos — Arrow-over-HTTP / JSON / Protobuf servers, only to demonstrate the alternatives.", "size": 13.5, "after": 6, "ls": 1.08},
@@ -282,15 +283,15 @@ code_box(s, Inches(7.2), Inches(4.45), Inches(5.35), Inches(1.5),
 # ============================================================================
 s = slide(6, "Key findings", kicker="Results")
 render(tbox(s, MX, Inches(1.55), Inches(6.0), Inches(4.6)),
-       [{"bullet": "dot", "runs": [{"text": "Arrow wins by 1–3 orders of magnitude", "size": 15, "bold": True, "color": NAVY},
+       [{"bullet": "dot", "runs": [{"text": "Arrow wins by 1–3 orders of magnitude", "size": 15, "bold": True, "color": PLUM},
                                    {"text": " — 150–1750× faster than JSON, 5–56× faster than the best Protobuf.", "size": 15, "color": INK}], "after": 10, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "Binary ≠ fast.", "size": 15, "bold": True, "color": NAVY},
+        {"bullet": "dot", "runs": [{"text": "Binary ≠ fast.", "size": 15, "bold": True, "color": PLUM},
                                    {"text": " Protobuf is binary and still 5–56× slower — it must parse every value.", "size": 15, "color": INK}], "after": 10, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "The gap grows with result size", "size": 15, "bold": True, "color": NAVY},
+        {"bullet": "dot", "runs": [{"text": "The gap grows with result size", "size": 15, "bold": True, "color": PLUM},
                                    {"text": " — ~150× on 29k rows → ~1750× on 1.75M rows.", "size": 15, "color": INK}], "after": 10, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "JSON is a bandwidth hog too", "size": 15, "bold": True, "color": NAVY},
+        {"bullet": "dot", "runs": [{"text": "JSON is a bandwidth hog too", "size": 15, "bold": True, "color": PLUM},
                                    {"text": " — 8× heavier on the wire than Arrow + zstd.", "size": 15, "color": INK}], "after": 10, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "Same engine throughout.", "size": 15, "bold": True, "color": NAVY},
+        {"bullet": "dot", "runs": [{"text": "Same engine throughout.", "size": 15, "bold": True, "color": PLUM},
                                    {"text": " Only the wire format changes — so the wire is the cause.", "size": 15, "color": INK}], "ls": 1.1}])
 s.shapes.add_picture(str(SPD), Inches(7.0), Inches(1.7), width=Inches(5.6))
 render(tbox(s, Inches(7.0), Inches(6.35), Inches(5.6), Inches(0.4)),
@@ -302,11 +303,11 @@ render(tbox(s, Inches(7.0), Inches(6.35), Inches(5.6), Inches(0.4)),
 s = slide(7, "Performance: same query, five wire formats", kicker="Benchmark")
 s.shapes.add_picture(str(LAT), Inches(1.35), Inches(1.65), width=Inches(8.4))
 render(tbox(s, Inches(10.0), Inches(1.9), Inches(2.6), Inches(4.6)),
-       [{"text": "1.75M rows", "size": 15, "bold": True, "color": NAVY, "after": 2},
+       [{"text": "1.75M rows", "size": 15, "bold": True, "color": PLUM, "after": 2},
         {"text": "one query, one engine", "size": 11.5, "color": GRAY, "after": 14},
-        {"runs": [{"text": "Flight  ", "size": 14, "bold": True, "color": TEAL}, {"text": "67 ms", "size": 14, "color": INK}], "after": 6},
-        {"runs": [{"text": "JSON  ", "size": 14, "bold": True, "color": ORANGE}, {"text": "117 s", "size": 14, "color": INK}], "after": 14},
-        {"text": "Same result, ~1750× apart.", "size": 13, "italic": True, "color": NAVY, "ls": 1.15, "after": 10},
+        {"runs": [{"text": "Flight  ", "size": 14, "bold": True, "color": PURPLE}, {"text": "67 ms", "size": 14, "color": INK}], "after": 6},
+        {"runs": [{"text": "JSON  ", "size": 14, "bold": True, "color": MAGENTA}, {"text": "117 s", "size": 14, "color": INK}], "after": 14},
+        {"text": "Same result, ~1750× apart.", "size": 13, "italic": True, "color": PLUM, "ls": 1.15, "after": 10},
         {"text": "Pushdown happens before serialization — and compounds with picking a fast wire.", "size": 11.5, "color": GRAY, "ls": 1.15}])
 render(tbox(s, Inches(1.35), Inches(6.55), Inches(8.4), Inches(0.4)),
        [{"text": "Apple M4, localhost loopback (understates Arrow's win on a real network). Source: docs/PERFORMANCE_REPORT.md",
@@ -319,9 +320,9 @@ s = slide(8, "Demo: one query, every transport", kicker="See it")
 render(tbox(s, MX, Inches(1.5), Inches(6.1), Inches(4.6)),
        [{"text": "A runnable notebook spins up all four transports, runs the SAME query over each, "
                  "checks they return identical data, and times them.", "size": 15, "color": INK, "after": 12, "ls": 1.12},
-        {"bullet": "dot", "text": "Arrow Flight  ·  Arrow-over-HTTP  ·  REST/JSON  ·  gRPC/Protobuf", "size": 14, "bold": True, "color": NAVY, "after": 8, "ls": 1.1},
+        {"bullet": "dot", "text": "Arrow Flight  ·  Arrow-over-HTTP  ·  REST/JSON  ·  gRPC/Protobuf", "size": 14, "bold": True, "color": PLUM, "after": 8, "ls": 1.1},
         {"bullet": "dot", "runs": [{"text": "Result:  ", "size": 14, "color": INK},
-                                   {"text": "all four return the identical 14,006 rows", "size": 14, "bold": True, "color": TEAL},
+                                   {"text": "all four return the identical 14,006 rows", "size": 14, "bold": True, "color": PURPLE},
                                    {"text": " — Flight fastest by far.", "size": 14, "color": INK}], "after": 8, "ls": 1.1},
         {"bullet": "dot", "text": "Discovery, filtering and serialization are all kob's job — zero schema config.", "size": 14, "color": INK, "ls": 1.1}])
 code_box(s, Inches(7.0), Inches(1.7), Inches(5.55), Inches(1.35),
@@ -341,22 +342,22 @@ render(tbox(s, Inches(7.0), Inches(6.15), Inches(5.55), Inches(0.4)),
 # Slide 9 — Takeaways
 # ============================================================================
 s = prs.slides.add_slide(BLANK)
-fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.333), Inches(7.5)), NAVY)
-fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(1.7), Inches(13.333), Inches(0.06)), TEAL)
+fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.333), Inches(7.5)), PLUM)
+fill(s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(1.7), Inches(13.333), Inches(0.06)), MAGENTA)
 render(tbox(s, Inches(0.9), Inches(0.7), Inches(11.5), Inches(0.9)),
        [{"text": "Takeaways", "size": 34, "bold": True, "color": WHITE}])
 render(tbox(s, Inches(0.95), Inches(2.0), Inches(11.6), Inches(3.6)),
-       [{"bullet": "dot", "runs": [{"text": "Use Arrow on the wire, default to Flight. ", "size": 18, "bold": True, "color": TEAL},
-                                   {"text": "Not JSON (150–1750× slower, 8× heavier), not Protobuf (5–56× slower).", "size": 18, "color": RGBColor(0xDF,0xEA,0xE8)}], "after": 14, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "Self-discovering beats configured. ", "size": 18, "bold": True, "color": TEAL},
-                                   {"text": "Point kob at a folder; new data appears live, no restart, no schema.", "size": 18, "color": RGBColor(0xDF,0xEA,0xE8)}], "after": 14, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "Minimal & safe by construction. ", "size": 18, "bold": True, "color": TEAL},
-                                   {"text": "Four deps, ~750-line core, read-only, parameterised, sandboxed.", "size": 18, "color": RGBColor(0xDF,0xEA,0xE8)}], "after": 14, "ls": 1.1},
-        {"bullet": "dot", "runs": [{"text": "It's the wire, not the engine. ", "size": 18, "bold": True, "color": TEAL},
-                                   {"text": "Hold DuckDB constant and the format alone moves latency by 1750×.", "size": 18, "color": RGBColor(0xDF,0xEA,0xE8)}], "ls": 1.1}])
+       [{"bullet": "dot", "runs": [{"text": "Use Arrow on the wire, default to Flight. ", "size": 18, "bold": True, "color": ACCENTL},
+                                   {"text": "Not JSON (150–1750× slower, 8× heavier), not Protobuf (5–56× slower).", "size": 18, "color": ONDARK}], "after": 14, "ls": 1.1},
+        {"bullet": "dot", "runs": [{"text": "Self-discovering beats configured. ", "size": 18, "bold": True, "color": ACCENTL},
+                                   {"text": "Point kob at a folder; new data appears live, no restart, no schema.", "size": 18, "color": ONDARK}], "after": 14, "ls": 1.1},
+        {"bullet": "dot", "runs": [{"text": "Minimal & safe by construction. ", "size": 18, "bold": True, "color": ACCENTL},
+                                   {"text": "Four deps, ~750-line core, read-only, parameterised, sandboxed.", "size": 18, "color": ONDARK}], "after": 14, "ls": 1.1},
+        {"bullet": "dot", "runs": [{"text": "It's the wire, not the engine. ", "size": 18, "bold": True, "color": ACCENTL},
+                                   {"text": "Hold DuckDB constant and the format alone moves latency by 1750×.", "size": 18, "color": ONDARK}], "ls": 1.1}])
 render(tbox(s, Inches(0.95), Inches(6.1), Inches(11.6), Inches(0.8)),
-       [{"runs": [{"text": "README.md  ·  docs/DESIGN.md  ·  docs/PERFORMANCE_REPORT.md          ", "size": 13, "color": GRAY},
-                  {"text": "github.com/iyedexe/kob", "size": 13, "bold": True, "color": TEAL}]}])
+       [{"runs": [{"text": "README.md  ·  docs/DESIGN.md  ·  docs/PERFORMANCE_REPORT.md          ", "size": 13, "color": ONDARKMUTE},
+                  {"text": "github.com/iyedexe/kob", "size": 13, "bold": True, "color": ACCENTL}]}])
 
 OUT = HERE / "kob.pptx"
 prs.save(str(OUT))
