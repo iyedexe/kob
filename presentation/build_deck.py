@@ -41,6 +41,15 @@ ACCENTL = RGBColor(0xCB, 0x9F, 0xE0)   # bright accent, readable on dark
 CHART_LAT = ["#6d2c8f", "#8e44ad", "#a05eb5", "#c9a0dc", "#c71e7a"]
 CHART_SPD = ["#6d2c8f", "#8e44ad", "#a05eb5", "#c9a0dc"]
 
+# ---- typography -------------------------------------------------------------
+# Anthropic's brand/ads use an editorial serif (Tiempos / Copernicus — proprietary,
+# not installed by default). Georgia is a universally-available stand-in with the same
+# warm, bookish serif feel. Swap SERIF below to the licensed family name if you have it.
+SERIF = "Georgia"
+MONO = "Consolas"
+plt.rcParams.update({"font.family": "serif",
+                     "font.serif": ["Georgia", "Times New Roman", "DejaVu Serif"]})
+
 # ============================================================================
 # Charts
 # ============================================================================
@@ -123,7 +132,7 @@ def render(tf, items):
             r.font.bold = seg.get("bold", it.get("bold", False))
             r.font.italic = seg.get("italic", it.get("italic", False))
             r.font.color.rgb = seg.get("color", it.get("color", INK))
-            r.font.name = seg.get("font", it.get("font", "Calibri"))
+            r.font.name = seg.get("font", it.get("font", SERIF))
 
 def slide(idx, title=None, kicker=None):
     s = prs.slides.add_slide(BLANK)
@@ -146,7 +155,7 @@ def code_box(s, x, y, w, h, lines, size=12.5):
     tf = box.text_frame; tf.word_wrap = True; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
     tf.margin_left = Inches(0.22); tf.margin_right = Inches(0.2)
     tf.margin_top = Inches(0.14); tf.margin_bottom = Inches(0.14)
-    render(tf, [{"text": ln, "size": size, "color": CODEFG, "font": "Consolas", "after": 3, "ls": 1.1}
+    render(tf, [{"text": ln, "size": size, "color": CODEFG, "font": MONO, "after": 3, "ls": 1.1}
                 for ln in lines])
     return box
 
@@ -172,7 +181,7 @@ def table(s, x, y, w, rows, col_w, head_fill=PLUM, row_h=Inches(0.42)):
             r.font.size = Pt(13 if i == 0 else 12.5)
             r.font.bold = i == 0
             r.font.color.rgb = WHITE if i == 0 else INK
-            r.font.name = "Calibri"
+            r.font.name = SERIF
     return gt
 
 # ============================================================================
