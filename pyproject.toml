@@ -21,6 +21,9 @@ gen = ["numpy>=2.0", "scipy>=1.13", "pandas>=2.2"]
 client = ["requests>=2.32", "pandas>=2.2"]
 # Benchmark harness + the gRPC/Protobuf comparison baseline.
 bench = ["requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7"]
+# Demo notebook (Jupyter) — runs every transport end to end (notebooks/kob_transports_demo.ipynb).
+demo = ["pandas>=2.2", "requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7",
+        "matplotlib>=3.8", "jupyterlab>=4.2", "ipykernel>=6.29"]
 # Everything, for development.
 all = ["numpy>=2.0", "scipy>=1.13", "pandas>=2.2", "requests>=2.32", "grpcio>=1.66", "protobuf>=6.33,<7"]
 

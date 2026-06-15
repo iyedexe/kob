@@ -203,6 +203,13 @@ uv sync --extra bench && uv run kob-demo-proto    # gRPC/Protobuf (:8816)
 uv run --extra bench kob-bench --scale small      # the shoot-out → docs/BENCHMARKS.md
 ```
 
+Or run the **demo notebook** — it spins up every transport, runs the *same* query over
+Flight / HTTP-Arrow / JSON / Protobuf, checks they return identical data, and times them:
+
+```bash
+uv sync --extra demo && make notebook    # notebooks/kob_transports_demo.ipynb
+```
+
 Measured on this data: Flight is **150–1750× faster than JSON** and **5–56× faster than
 the best Protobuf** ([full report](docs/PERFORMANCE_REPORT.md)).
 

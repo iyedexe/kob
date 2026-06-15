@@ -1,6 +1,6 @@
 # Convenience targets. Requires: uv, (optional) dotnet, cmake + apache-arrow for C++.
 .PHONY: help setup data data-small data-medium data-large serve flight \
-        demo-arrow demo-json demo-proto bench \
+        demo-arrow demo-json demo-proto notebook bench \
         client csharp-build csharp-run cpp-build cpp-run clean clean-data
 
 ARROW_PREFIX := $(shell brew --prefix apache-arrow 2>/dev/null)
@@ -29,6 +29,8 @@ demo-json:       ## Run the REST/JSON demo server on :8002
 	uv run kob-demo-json
 demo-proto:      ## Run the gRPC/Protobuf demo server on :8816 (needs [bench])
 	uv run --extra bench kob-demo-proto
+notebook:        ## Launch the transports demo notebook in JupyterLab (needs [demo])
+	uv run --extra demo jupyter lab notebooks/kob_transports_demo.ipynb
 
 bench:           ## Benchmark Flight vs HTTP-Arrow vs Proto vs REST/JSON (needs [bench])
 	uv run --extra bench kob-bench --out docs/BENCHMARKS.md
