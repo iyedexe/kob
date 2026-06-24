@@ -147,7 +147,7 @@ def slide(idx, title=None, kicker=None):
     render(tbox(s, MX, Inches(7.02), CW, Inches(0.32)),
            [{"runs": [{"text": "kob", "bold": True, "color": PURPLE, "size": 10},
                       {"text": "  ·  self-discovering Parquet → Apache Arrow", "color": GRAY, "size": 10},
-                      {"text": f"          {idx} / 9", "color": GRAY, "size": 10}]}])
+                      {"text": f"          {idx} / 10", "color": GRAY, "size": 10}]}])
     return s
 
 def code_box(s, x, y, w, h, lines, size=12.5):
@@ -246,9 +246,45 @@ for k, (h, b, a) in enumerate(cards):
     card(s, xs[k % 2], ys[k // 2], Inches(5.85), Inches(1.95), h, b, a)
 
 # ============================================================================
-# Slide 4 — Theory: why Arrow
+# Slide 4 — Row vs columnar primer (list of dicts vs DataFrame)
 # ============================================================================
-s = slide(4, "Why Apache Arrow — the 30-second theory", kicker="Theory")
+s = slide(4, "List of dicts vs. columns — the same data, two shapes", kicker="Data layout")
+render(tbox(s, MX, Inches(1.5), CW, Inches(0.6)),
+       [{"text": "Before the speed story — the SAME little table, in the two shapes a server can hand you.",
+         "size": 15, "color": INK, "ls": 1.25}])
+# left — row-oriented JSON (a list of dicts)
+code_box(s, MX, Inches(2.25), Inches(5.75), Inches(2.3),
+         ['[',
+          '  {"symbol":"AAPL", "strike":200, "bid":5.20},',
+          '  {"symbol":"AAPL", "strike":205, "bid":3.10},',
+          '  {"symbol":"MSFT", "strike":300, "bid":8.40}',
+          ']'], size=12)
+render(tbox(s, MX, Inches(4.62), Inches(5.75), Inches(1.1)),
+       [{"runs": [{"text": "Row-oriented — JSON, a list of dicts.  ", "size": 12.5, "bold": True, "color": MAGENTA},
+                  {"text": "Keys repeat on every row; values stored field-by-field. To read one "
+                           "column you walk every row and pull that field — decode all of it, then "
+                           "rebuild columns.", "size": 12, "color": INK}], "ls": 1.22}])
+# right — columnar / DataFrame (Arrow)
+code_box(s, Inches(6.85), Inches(2.25), Inches(5.75), Inches(2.3),
+         ['symbol : ["AAPL", "AAPL", "MSFT"]',
+          'strike : [ 200,    205,    300  ]',
+          'bid    : [ 5.20,   3.10,   8.40 ]'], size=12)
+render(tbox(s, Inches(6.85), Inches(4.62), Inches(5.75), Inches(1.1)),
+       [{"runs": [{"text": "Columnar — a DataFrame / Arrow.  ", "size": 12.5, "bold": True, "color": PURPLE},
+                  {"text": "Each column is one contiguous array; keys stored once. A whole column is "
+                           "already laid out for vectorized ops, compression, and zero-copy transfer.",
+                   "size": 12, "color": INK}], "ls": 1.22}])
+render(tbox(s, MX, Inches(5.95), CW, Inches(0.9)),
+       [{"runs": [{"text": "Why it matters:  ", "size": 14, "bold": True, "color": PLUM},
+                  {"text": "pandas, Polars and Arrow are all columnar in memory — so kob serving Arrow "
+                           "is that exact layout, nothing to translate; JSON forces a row-by-row encode "
+                           "on the way out and a decode + column-rebuild on the way in.",
+                   "size": 13, "color": INK}], "ls": 1.24}])
+
+# ============================================================================
+# Slide 5 — Theory: why Arrow
+# ============================================================================
+s = slide(5, "Why Apache Arrow — the 30-second theory", kicker="Theory")
 render(tbox(s, MX, Inches(1.55), Inches(6.3), Inches(4.6)),
        [{"text": "Row vs. columnar is the whole story:", "size": 16, "bold": True, "color": PLUM, "after": 10},
         {"bullet": "dot", "text": "JSON & Protobuf are row-oriented. The sender encodes every value "
@@ -270,9 +306,9 @@ render(tbox(s, Inches(7.35), Inches(4.7), Inches(5.2), Inches(1.7)),
         {"text": "— Apache Arrow FAQ. That is exactly the cost Arrow removes.", "size": 12, "color": GRAY, "ls": 1.2}])
 
 # ============================================================================
-# Slide 5 — Architecture
+# Slide 6 — Architecture
 # ============================================================================
-s = slide(5, "Architecture: Flight + Swagger, one command", kicker="How it works")
+s = slide(6, "Architecture: Flight + Swagger, one command", kicker="How it works")
 render(tbox(s, MX, Inches(1.5), Inches(6.2), Inches(4.5)),
        [{"text": "One straight line, folder → Arrow stream:", "size": 15, "bold": True, "color": PLUM, "after": 8},
         {"bullet": "dot", "text": "core — discover (catalog), validate the query (contract), execute on DuckDB → Arrow (engine).", "size": 13.5, "after": 6, "ls": 1.28},
@@ -290,9 +326,9 @@ code_box(s, Inches(7.2), Inches(4.45), Inches(5.35), Inches(1.5),
           "  docs  (Swagger) HTTP     http://…:8000/docs"], size=12.5)
 
 # ============================================================================
-# Slide 6 — Key findings
+# Slide 7 — Key findings
 # ============================================================================
-s = slide(6, "Key findings", kicker="Results")
+s = slide(7, "Key findings", kicker="Results")
 render(tbox(s, MX, Inches(1.55), Inches(6.0), Inches(4.6)),
        [{"bullet": "dot", "runs": [{"text": "Arrow wins by 1–3 orders of magnitude", "size": 15, "bold": True, "color": PLUM},
                                    {"text": " — 150–1750× faster than JSON, 5–56× faster than the best Protobuf.", "size": 15, "color": INK}], "after": 10, "ls": 1.28},
@@ -309,9 +345,9 @@ render(tbox(s, Inches(7.0), Inches(4.65), Inches(5.6), Inches(0.4)),
        [{"text": "Speedup vs REST/JSON, 1.75M-row pull (medium dataset).", "size": 11, "italic": True, "color": GRAY, "align": PP_ALIGN.CENTER}])
 
 # ============================================================================
-# Slide 7 — Performance comparison
+# Slide 8 — Performance comparison
 # ============================================================================
-s = slide(7, "Performance: same query, five wire formats", kicker="Benchmark")
+s = slide(8, "Performance: same query, five wire formats", kicker="Benchmark")
 s.shapes.add_picture(str(LAT), Inches(1.35), Inches(1.65), width=Inches(8.4))
 render(tbox(s, Inches(10.0), Inches(1.9), Inches(2.6), Inches(4.6)),
        [{"text": "1.75M rows", "size": 15, "bold": True, "color": PLUM, "after": 2},
@@ -326,9 +362,9 @@ render(tbox(s, Inches(1.35), Inches(5.75), Inches(8.4), Inches(0.85)),
         {"text": "Source: docs/PERFORMANCE_REPORT.md", "size": 11, "italic": True, "color": GRAY, "align": PP_ALIGN.CENTER}])
 
 # ============================================================================
-# Slide 8 — Demo
+# Slide 9 — Demo
 # ============================================================================
-s = slide(8, "Demo: one query, every transport", kicker="See it")
+s = slide(9, "Demo: one query, every transport", kicker="See it")
 render(tbox(s, MX, Inches(1.5), Inches(6.1), Inches(4.6)),
        [{"text": "A runnable notebook spins up all four transports, runs the SAME query over each, "
                  "checks they return identical data, and times them.", "size": 15, "color": INK, "after": 12, "ls": 1.28},
