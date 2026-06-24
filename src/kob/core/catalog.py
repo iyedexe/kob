@@ -54,7 +54,9 @@ class Dataset:
 
     @property
     def glob(self) -> str:
-        return str(self.root / "**" / "*.parquet")
+        # Forward slashes (as_posix) so DuckDB's globber matches on Windows
+        # paths too — backslash separators and UNC "\\" confuse read_parquet.
+        return (self.root / "**" / "*.parquet").as_posix()
 
     def to_public_dict(self, *, with_values: bool = True) -> dict:
         return {
@@ -122,7 +124,12 @@ def _discover(name: str) -> Dataset | None:
     if sample is None:
         return None  # a folder with no Parquet is not a dataset
     try:
-        schema = pq.read_schema(sample)  # metadata only — no data read
+        # Read via an open file handle rather than handing pyarrow the path
+        # string: pyarrow's own path handling chokes on Windows UNC/network
+        # paths and on non-ASCII characters (accents, etc.), which silently
+        # hides the dataset. Python's open() handles those correctly.
+        with open(sample, "rb") as fh:
+            schema = pq.read_schema(fh)  # metadata only — no data read
     except Exception:
         return None
     data_columns = {f.name: _friendly(f.type) for f in schema if f.name not in part_keys}
@@ -143,15 +150,17 @@ def _discover(name: str) -> Dataset | None:
 
 
 def _safe_dataset_path(name: str) -> Path | None:
-    """Resolve a dataset name to a path strictly inside DATA_ROOT, or None."""
+    """Resolve a dataset name to a path strictly inside DATA_ROOT, or None.
+
+    ``name`` is always a single path segment (we reject anything containing a
+    separator or ``..``), so ``DATA_ROOT / name`` cannot escape the root. We
+    deliberately avoid ``Path.resolve()`` here: on Windows it can rewrite UNC /
+    network paths into an inconsistent extended-length form, which made the old
+    ``relative_to`` check raise and silently hide otherwise-valid datasets.
+    """
     if not name or "/" in name or "\\" in name or name in (".", ".."):
         return None
-    candidate = (DATA_ROOT / name).resolve()
-    try:
-        candidate.relative_to(DATA_ROOT)
-    except ValueError:
-        return None  # escaped the root
-    return candidate
+    return DATA_ROOT / name
 
 
 # --------------------------------------------------------------------------- #
