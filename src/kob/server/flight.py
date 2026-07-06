@@ -57,17 +57,19 @@ class ParquetFlightServer(flight.FlightServerBase):
             yield self._flight_info(req, descriptor)
 
     def get_flight_info(self, context, descriptor):
-        req = self._request_from_descriptor(descriptor)
         try:
+            # Parse inside the try: a malformed command must surface as a clean
+            # Flight error, not an opaque internal one.
+            req = self._request_from_descriptor(descriptor)
             return self._flight_info(req, descriptor)
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             raise flight.FlightServerError(str(exc)) from None
 
     def do_get(self, context, ticket):
         try:
             req = QueryRequest.from_dict(json.loads(ticket.ticket.decode()))
             reader = engine.execute_reader(req, self._batch_rows)
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             raise flight.FlightServerError(str(exc)) from None
         return flight.RecordBatchStream(reader)
 

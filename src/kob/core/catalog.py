@@ -10,7 +10,8 @@ and this module discovers, per dataset (a top-level folder containing Parquet):
 
 * **partition columns + their values** — read straight from the ``key=value`` folder
   names (filesystem only, no data scan) — these are the "filter per folder" options;
-* **data columns + types** — read from one Parquet file's schema (metadata only).
+* **data columns + types** — read from a few Parquet files' schemas (footers only,
+  never data), so one corrupt file or an evolved schema can't hide the dataset.
 
 Discovery is cached with a short TTL so freshly-dropped files/partitions appear without
 a restart, while steady-state lookups are a single dict hit (all derived lookups are
@@ -38,6 +39,11 @@ DATA_ROOT = Path(os.environ.get("KOB_DATA_ROOT", str(REPO_ROOT / "data"))).resol
 # Re-scan a dataset at most this often (seconds). New files in existing partitions
 # don't change the schema; new partitions/datasets surface within one TTL.
 DISCOVERY_TTL = float(os.environ.get("KOB_DISCOVERY_TTL", "15"))
+
+# How many Parquet footers to sample per dataset at discovery time (at most one
+# per directory). >1 makes discovery robust to a single corrupt/partial file and
+# picks up columns added by schema evolution, while staying metadata-only.
+MAX_SAMPLE_FILES = int(os.environ.get("KOB_MAX_SAMPLE_FILES", "4"))
 
 
 @dataclass(frozen=True)
@@ -92,47 +98,54 @@ def _friendly(t: pa.DataType) -> str:
 # --------------------------------------------------------------------------- #
 # Discovery
 # --------------------------------------------------------------------------- #
-def _scan_tree(dataset_root: Path) -> tuple[list[str], dict[str, set[str]], str | None, int]:
+def _scan_tree(dataset_root: Path) -> tuple[list[str], dict[str, set[str]], list[str], int]:
     part_values: dict[str, set[str]] = {}
-    sample: str | None = None
+    samples: list[str] = []
+    ordered: list[str] = []
     file_count = 0
     for dirpath, _dirnames, filenames in os.walk(dataset_root):
         rel = os.path.relpath(dirpath, dataset_root)
-        if rel != ".":
-            for seg in rel.split(os.sep):
-                if "=" in seg:
-                    k, v = seg.split("=", 1)
-                    part_values.setdefault(k, set()).add(v)
+        segs = [] if rel == "." else [s for s in rel.split(os.sep) if "=" in s]
+        for seg in segs:
+            k, v = seg.split("=", 1)
+            part_values.setdefault(k, set()).add(v)
         pqs = [f for f in filenames if f.endswith(".parquet")]
         file_count += len(pqs)
-        if sample is None and pqs:
-            sample = os.path.join(dirpath, pqs[0])
-    # Canonical partition-key order comes from the sample file's own path.
-    ordered: list[str] = []
-    if sample is not None:
-        relpath = os.path.relpath(os.path.dirname(sample), dataset_root)
-        if relpath != ".":
-            ordered = [s.split("=", 1)[0] for s in relpath.split(os.sep) if "=" in s]
-    return ordered, part_values, sample, file_count
+        if pqs and len(samples) < MAX_SAMPLE_FILES:
+            samples.append(os.path.join(dirpath, pqs[0]))
+        # Canonical partition-key order comes from the first *partitioned* file's
+        # own path — a stray Parquet at the dataset root must not erase it.
+        if pqs and segs and not ordered:
+            ordered = [s.split("=", 1)[0] for s in segs]
+    return ordered, part_values, samples, file_count
 
 
 def _discover(name: str) -> Dataset | None:
     root = _safe_dataset_path(name)
     if root is None or not root.is_dir():
         return None
-    part_keys, part_values, sample, file_count = _scan_tree(root)
-    if sample is None:
+    part_keys, part_values, samples, file_count = _scan_tree(root)
+    if not samples:
         return None  # a folder with no Parquet is not a dataset
-    try:
-        # Read via an open file handle rather than handing pyarrow the path
-        # string: pyarrow's own path handling chokes on Windows UNC/network
-        # paths and on non-ASCII characters (accents, etc.), which silently
-        # hides the dataset. Python's open() handles those correctly.
-        with open(sample, "rb") as fh:
-            schema = pq.read_schema(fh)  # metadata only — no data read
-    except Exception:
-        return None
-    data_columns = {f.name: _friendly(f.type) for f in schema if f.name not in part_keys}
+    # Merge the schemas of the sampled footers (metadata only — no data read):
+    # one corrupt/partial file no longer hides the dataset, and columns added by
+    # schema evolution are discovered if any sampled file carries them.
+    data_columns: dict[str, str] = {}
+    for sample in samples:
+        try:
+            # Read via an open file handle rather than handing pyarrow the path
+            # string: pyarrow's own path handling chokes on Windows UNC/network
+            # paths and on non-ASCII characters (accents, etc.), which silently
+            # hides the dataset. Python's open() handles those correctly.
+            with open(sample, "rb") as fh:
+                schema = pq.read_schema(fh)
+        except Exception:
+            continue  # skip an unreadable/corrupt candidate; another may work
+        for f in schema:
+            if f.name not in part_keys:
+                data_columns.setdefault(f.name, _friendly(f.type))
+    if not data_columns:
+        return None  # every sampled file was unreadable
     columns = dict(data_columns)
     for k in part_keys:
         columns.setdefault(k, "string")  # Hive keys arrive as strings (DuckDB re-infers)
@@ -181,6 +194,10 @@ def get_dataset(name: str, *, refresh: bool = False) -> Dataset:
             return cached
     ds = _discover(name)  # outside the lock (does IO)
     if ds is None:
+        with _lock:
+            # Evict any stale entry: a dataset deleted from disk must go 404,
+            # not be served from cache until process restart.
+            _cache.pop(name, None)
         raise KeyError(f"Unknown dataset '{name}' (no Parquet found under {DATA_ROOT}/{name})")
     with _lock:
         _cache[name] = ds

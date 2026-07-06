@@ -1,5 +1,5 @@
 # Convenience targets. Requires: uv, (optional) dotnet, cmake + apache-arrow for C++.
-.PHONY: help setup data data-small data-medium data-large serve flight \
+.PHONY: help setup test data data-small data-medium data-large serve flight \
         demo-arrow demo-json demo-proto notebook bench \
         client csharp-build csharp-run cpp-build cpp-run clean clean-data
 
@@ -10,6 +10,9 @@ help:
 
 setup:           ## Install the minimal core server (4 deps)
 	uv sync
+
+test:            ## Run the test suite (core deps only, no framework)
+	uv run python tests/test_kob.py
 
 data-small:      ## Generate the small sample dataset (needs [gen])
 	uv run --extra gen kob-gen --scale small

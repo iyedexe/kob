@@ -36,17 +36,20 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     global _conn
     with _conn_lock:
         if _conn is None:
-            _conn = duckdb.connect(database=":memory:")
+            conn = duckdb.connect(database=":memory:")
             threads = os.environ.get("KOB_DUCKDB_THREADS")
             if threads:
-                _conn.execute(f"SET threads TO {int(threads)}")
+                conn.execute(f"SET threads TO {int(threads)}")
             # Parallel scans don't need to preserve row order for analytical reads.
-            _conn.execute("SET preserve_insertion_order = false")
+            conn.execute("SET preserve_insertion_order = false")
             # Cache Parquet footers/metadata across queries (big win on repeated queries).
             try:
-                _conn.execute("SET enable_object_cache = true")
+                conn.execute("SET enable_object_cache = true")
             except duckdb.Error:
                 pass  # setting renamed/removed in some versions — never fatal
+            # Publish only once fully configured, so a failed SET above can't
+            # leave a half-configured connection behind for every later query.
+            _conn = conn
         return _conn
 
 
@@ -73,9 +76,13 @@ def execute_reader(req: QueryRequest, batch_rows: int = DEFAULT_BATCH_ROWS) -> p
     """
     sql, params = build_sql(req)
     cur = cursor()
-    cur.execute(sql, params)
-    duck_reader = _arrow_reader(cur, batch_rows)
-    schema = duck_reader.schema
+    try:
+        cur.execute(sql, params)
+        duck_reader = _arrow_reader(cur, batch_rows)
+        schema = duck_reader.schema
+    except Exception:
+        cur.close()  # the generator below never runs, so close here
+        raise
 
     def _batches():
         # `cur` and `duck_reader` are read (never reassigned) here, so they are
@@ -94,8 +101,11 @@ def fetch_schema(req: QueryRequest) -> pa.Schema:
     """Cheaply resolve the Arrow output schema (used by Flight ``get_flight_info``)."""
     sql, params = build_sql(req)
     cur = cursor()
-    cur.execute(f"SELECT * FROM ({sql}) AS _schema_probe LIMIT 0", params)
-    return _arrow_reader(cur, 1).schema
+    try:
+        cur.execute(f"SELECT * FROM ({sql}) AS _schema_probe LIMIT 0", params)
+        return _arrow_reader(cur, 1).schema  # Schema is materialised; safe to close
+    finally:
+        cur.close()
 
 
 def column_facets(dataset: str, columns: list[str], *, distinct: bool = False) -> dict[str, dict]:
@@ -106,20 +116,26 @@ def column_facets(dataset: str, columns: list[str], *, distinct: bool = False) -
     """
     from .catalog import get_dataset  # local import avoids a cycle
 
+    from .contract import _ident  # local import avoids a cycle
+
     ds = get_dataset(dataset)
     cols = [c for c in columns if c in ds.allowed_columns]
     if not cols:
         return {}
     selects = []
     for i, c in enumerate(cols):
-        selects.append(f'min("{c}") AS mn{i}, max("{c}") AS mx{i}')
+        q = _ident(c)
+        selects.append(f"min({q}) AS mn{i}, max({q}) AS mx{i}")
         if distinct:
-            selects.append(f'approx_count_distinct("{c}") AS nd{i}')
+            selects.append(f"approx_count_distinct({q}) AS nd{i}")
     glob = ds.glob.replace("'", "''")
     sql = (f"SELECT {', '.join(selects)} "
            f"FROM read_parquet('{glob}', hive_partitioning = true, union_by_name = true)")
     cur = cursor()
-    row = cur.execute(sql).fetchone()
+    try:
+        row = cur.execute(sql).fetchone()
+    finally:
+        cur.close()
     out: dict[str, dict] = {}
     idx = 0
     for c in cols:

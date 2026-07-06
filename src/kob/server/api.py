@@ -17,8 +17,10 @@ schema and all values are bound parameters, so untrusted clients cannot inject S
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
+import duckdb
 import pyarrow as pa
 import pyarrow.csv as pacsv
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -35,12 +37,21 @@ DEFAULT_FLIGHT_LOCATION = "grpc://127.0.0.1:8815"
 # --------------------------------------------------------------------------- #
 # Interop result encoders (JSON / CSV). The binary fast path is Flight, not this.
 # --------------------------------------------------------------------------- #
+def _json_safe(v: Any) -> Any:
+    # NaN/±Inf are not valid JSON: json.dumps would emit bare NaN/Infinity
+    # tokens that strict parsers (browsers, most languages) reject outright.
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    return v
+
+
 def _stream_json(reader: pa.RecordBatchReader):
     """Row-JSON for browsers/interop — intentionally simple, never the fast path."""
     yield b"["
     first = True
     for batch in reader:
         for row in batch.to_pylist():
+            row = {k: _json_safe(v) for k, v in row.items()}
             yield (b"" if first else b",") + json.dumps(row, default=str).encode()
             first = False
     yield b"]"
@@ -161,7 +172,10 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
             else:
                 raise HTTPException(400, f"Unknown column '{c}' for dataset '{name}'")
         if data_cols:
-            out.update(engine.column_facets(name, data_cols, distinct=distinct))
+            try:
+                out.update(engine.column_facets(name, data_cols, distinct=distinct))
+            except duckdb.Error as exc:
+                raise HTTPException(400, f"Facet query failed: {exc}") from None
         return {"dataset": name, "facets": out}
 
     @app.get("/flight", tags=["Flight"], summary="How to pull results over Arrow Flight (the fast path)")
@@ -192,7 +206,10 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
         responses={200: {"description": "Result rows in the requested format.",
                          "content": {"application/json": {}, "text/csv": {}}}},
     )
-    async def query(
+    def query(
+        # A sync endpoint on purpose: FastAPI runs it on the threadpool, so the
+        # blocking DuckDB execute can't stall the event loop (an `async def`
+        # here froze every other request for the duration of the query).
         body: QueryModel,
         format: str = Query("json", pattern="^(json|csv)$",
                             description="json (default) or csv. For binary/throughput, use Arrow Flight."),
@@ -204,6 +221,10 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
             raise HTTPException(404, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
+        except duckdb.Error as exc:
+            # e.g. a filter value that can't cast to the column's type — a bad
+            # request, not a server fault; don't 500 with a raw stack trace.
+            raise HTTPException(400, f"Query failed: {exc}") from None
 
         if format == "csv":
             return Response(content=_csv_bytes(reader), media_type="text/csv")

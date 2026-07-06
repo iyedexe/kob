@@ -74,6 +74,15 @@ class QueryRequest:
         }
 
 
+def _ident(name: str) -> str:
+    """Quote a SQL identifier; embedded double quotes are doubled per SQL rules.
+
+    Column names come from the discovered Parquet schema (producer-controlled),
+    so a name containing ``"`` must not be able to break out of the quoting.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _validate(req: QueryRequest) -> Dataset:
     ds = get_dataset(req.dataset)
     if req.columns:
@@ -85,6 +94,15 @@ def _validate(req: QueryRequest) -> Dataset:
             raise ValueError(f"Unknown filter column for '{ds.name}': {f.column!r}")
         if f.op.lower() not in ALLOWED_OPS:
             raise ValueError(f"Unsupported operator: {f.op!r}")
+        if f.op.lower() in _LIST_OPS and (
+            isinstance(f.value, (str, bytes)) or not isinstance(f.value, (list, tuple, set))
+        ):
+            # A plain string would silently iterate character-by-character
+            # ("eu" -> IN ('e','u')); anything non-iterable would blow up later.
+            raise ValueError(
+                f"Operator {f.op!r} on {f.column!r} requires a list of values, "
+                f'e.g. {{"column": "{f.column}", "op": "{f.op}", "value": ["a", "b"]}}'
+            )
     if req.limit is not None and not (0 < req.limit <= MAX_LIMIT):
         raise ValueError(f"limit must be in (0, {MAX_LIMIT}]")
     return ds
@@ -99,7 +117,7 @@ def build_sql(req: QueryRequest) -> tuple[str, list[Any]]:
     ds = _validate(req)
 
     if req.columns:
-        projection = ", ".join(f'"{c}"' for c in req.columns)
+        projection = ", ".join(_ident(c) for c in req.columns)
     else:
         projection = "*"
 
@@ -113,7 +131,7 @@ def build_sql(req: QueryRequest) -> tuple[str, list[Any]]:
     params: list[Any] = []
     clauses: list[str] = []
     for f in req.filters:
-        col = f'"{f.column}"'
+        col = _ident(f.column)
         op = f.op.lower()
         if op in _LIST_OPS:
             values = list(f.value)
