@@ -24,12 +24,13 @@ import duckdb
 import pyarrow as pa
 import pyarrow.csv as pacsv
 from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..core import engine
-from ..core.catalog import DATA_ROOT, get_dataset, list_datasets
+from ..core.catalog import DATA_ROOT, DATA_ROOT_DISPLAY, IS_URL_ROOT, get_dataset, list_datasets
 from ..core.contract import QueryRequest
+from ..core.metrics import DASHBOARD_HTML, METRICS, timed
 
 DEFAULT_FLIGHT_LOCATION = "grpc://127.0.0.1:8815"
 
@@ -130,13 +131,14 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
     def health() -> dict:
         # Deliberately no discovery here: health probes fire constantly and must
         # never pay a tree walk. /datasets is the discovery endpoint.
-        return {"status": "ok", "data_root": str(DATA_ROOT), "data_root_exists": DATA_ROOT.is_dir(),
+        return {"status": "ok", "data_root": DATA_ROOT_DISPLAY,
+                "data_root_exists": None if IS_URL_ROOT else DATA_ROOT.is_dir(),
                 "flight": flight_location}
 
     @app.get("/datasets", tags=["Discovery"], summary="List discovered datasets")
     def datasets(refresh: bool = False) -> dict:
         return {
-            "data_root": str(DATA_ROOT),
+            "data_root": DATA_ROOT_DISPLAY,
             "datasets": [ds.to_public_dict(with_values=False) for ds in list_datasets(refresh=refresh)],
         }
 
@@ -214,21 +216,39 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
         format: str = Query("json", pattern="^(json|csv)$",
                             description="json (default) or csv. For binary/throughput, use Arrow Flight."),
     ):
-        try:
-            req = QueryRequest.from_dict(body.model_dump())
-            reader = engine.execute_reader(req)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from None
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from None
-        except duckdb.Error as exc:
-            # e.g. a filter value that can't cast to the column's type — a bad
-            # request, not a server fault; don't 500 with a raw stack trace.
-            raise HTTPException(400, f"Query failed: {exc}") from None
+        with timed("query.total", body.dataset):
+            try:
+                req = QueryRequest.from_dict(body.model_dump())
+                reader = engine.execute_reader(req)
+            except KeyError as exc:
+                raise HTTPException(404, str(exc)) from None
+            except ValueError as exc:
+                METRICS.incr("query.error")
+                raise HTTPException(400, str(exc)) from None
+            except duckdb.Error as exc:
+                # e.g. a filter value that can't cast to the column's type — a bad
+                # request, not a server fault; don't 500 with a raw stack trace.
+                METRICS.incr("query.error")
+                raise HTTPException(400, f"Query failed: {exc}") from None
 
-        if format == "csv":
-            return Response(content=_csv_bytes(reader), media_type="text/csv")
-        return StreamingResponse(_stream_json(reader), media_type="application/json")
+            if format == "csv":
+                with timed("query.serialize.csv", body.dataset):
+                    content = _csv_bytes(reader)
+                return Response(content=content, media_type="text/csv")
+            # JSON streams lazily after we return, so only setup is counted here;
+            # the heavy DuckDB cost is captured separately as `query.execute`.
+            return StreamingResponse(_stream_json(reader), media_type="application/json")
+
+    @app.get("/metrics", tags=["Discovery"], summary="Timing + counters (JSON)")
+    def metrics() -> dict:
+        # Answers "is discovery slow or is the query slow?": discover.* vs query.*
+        # timers, cache hit-rate, and the slowest recent ops.
+        return METRICS.snapshot()
+
+    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False,
+             summary="Live metrics dashboard")
+    def dashboard() -> str:
+        return DASHBOARD_HTML
 
     return app
 

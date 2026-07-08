@@ -188,6 +188,100 @@ def test_stream_json_nan_inf_are_null():
     assert all(v is None or math.isfinite(v) for v in vals)
 
 
+# --------------------------------------------------------------------------- #
+# Query source: pruning, union_by_name, glob fallback (network-share speedups)
+# --------------------------------------------------------------------------- #
+def test_source_prunes_to_matching_partition_files():
+    _reset("parts")
+    _write("parts/sym=AAPL/p.parquet", pa.table({"v": [1]}))
+    _write("parts/sym=MSFT/p.parquet", pa.table({"v": [2]}))
+    ds = catalog.get_dataset("parts")
+    assert len(ds.files) == 2
+    sql, _ = build_sql(QueryRequest(dataset="parts", filters=[Filter("sym", "=", "AAPL")]))
+    assert "read_parquet([" in sql, "should hand DuckDB an explicit file list, not a glob"
+    assert "sym=AAPL" in sql and "sym=MSFT" not in sql, "did not prune to the matching partition"
+    assert _q(dataset="parts", filters=[Filter("sym", "=", "AAPL")]).num_rows == 1
+    sql2, _ = build_sql(QueryRequest(dataset="parts", filters=[Filter("sym", "in", ["AAPL", "MSFT"])]))
+    assert "sym=AAPL" in sql2 and "sym=MSFT" in sql2
+
+
+def test_union_by_name_auto_and_override():
+    _reset("uni")
+    _write("uni/a.parquet", pa.table({"v": [1]}))
+    ds = catalog.get_dataset("uni")
+    assert ds.schema_uniform is True
+    assert "union_by_name = false" in ds.source(), "uniform schema should skip union_by_name"
+
+    _reset("evo2")
+    _write("evo2/y=1/a.parquet", pa.table({"v": [1]}))
+    _write("evo2/y=2/b.parquet", pa.table({"v": [2], "w": [3]}))
+    ds2 = catalog.get_dataset("evo2")
+    assert ds2.schema_uniform is False
+    assert "union_by_name = true" in ds2.source()
+
+    old = catalog._UNION_ENV
+    try:
+        catalog._UNION_ENV = "0"  # env override wins even when non-uniform
+        assert "union_by_name = false" in ds2.source()
+    finally:
+        catalog._UNION_ENV = old
+
+
+def test_use_glob_fallback():
+    _reset("g")
+    _write("g/a.parquet", pa.table({"v": [1]}))
+    ds = catalog.get_dataset("g")
+    old = catalog.USE_GLOB
+    try:
+        catalog.USE_GLOB = True
+        src = ds.source()
+        assert "**/*.parquet" in src and "read_parquet('" in src, "KOB_USE_GLOB should force a glob"
+    finally:
+        catalog.USE_GLOB = old
+
+
+# --------------------------------------------------------------------------- #
+# Observability
+# --------------------------------------------------------------------------- #
+def test_metrics_and_dashboard():
+    from kob.core.metrics import DASHBOARD_HTML, METRICS
+    METRICS.reset()
+    _reset("m")
+    _write("m/a.parquet", pa.table({"v": [1, 2]}))
+    catalog.get_dataset("m")   # discovery timer
+    _q(dataset="m")            # query.execute timer
+    snap = METRICS.snapshot()
+    assert "discover.dataset" in snap["timers"], "discovery not timed"
+    assert "query.execute" in snap["timers"], "query not timed"
+    assert snap["counters"].get("cache.miss", 0) >= 1
+    assert isinstance(DASHBOARD_HTML, str) and "fetch('metrics')" in DASHBOARD_HTML
+
+
+# --------------------------------------------------------------------------- #
+# Object-store URL support (helpers exercised on local paths — no cloud account)
+# --------------------------------------------------------------------------- #
+def test_url_detection():
+    assert catalog._is_url("s3://bucket/x")
+    assert catalog._is_url("https://host/x")
+    assert catalog._is_url("az://c/x")
+    assert not catalog._is_url("/mnt/share/data")
+    assert not catalog._is_url("C:/data")
+
+
+def test_remote_discovery_building_blocks_on_local_files():
+    # The remote-discovery machinery (DuckDB glob + DESCRIBE) works on local paths,
+    # so it's exercised here without a cloud account.
+    _reset("remote")
+    _write("remote/sym=AAPL/p.parquet", pa.table({"v": [1.0]}))
+    _write("remote/sym=MSFT/p.parquet", pa.table({"v": [2.0]}))
+    base = (_TMP / "remote").as_posix()
+    files = catalog._glob_via_duckdb(f"{base}/**/*.parquet")
+    assert len(files) == 2 and all(f.endswith(".parquet") for f in files)
+    part_values, ordered = catalog._partitions_from_paths(base, files)
+    assert ordered == ["sym"] and set(part_values["sym"]) == {"AAPL", "MSFT"}
+    assert catalog._schema_via_duckdb(files[0]) == {"v": "double"}
+
+
 if __name__ == "__main__":
     failures = 0
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

@@ -121,12 +121,9 @@ def build_sql(req: QueryRequest) -> tuple[str, list[Any]]:
     else:
         projection = "*"
 
-    # Glob is server-controlled (from discovery), so inlining is safe. Escape quotes defensively.
-    glob_literal = ds.glob.replace("'", "''")
-    sql = (
-        f"SELECT {projection} "
-        f"FROM read_parquet('{glob_literal}', hive_partitioning = true, union_by_name = true)"
-    )
+    # Source (an explicit, partition-pruned file list where possible, else a glob)
+    # is server-controlled — built by the trusted catalog from discovery.
+    sql = f"SELECT {projection} FROM {ds.source(req.filters)}"
 
     params: list[Any] = []
     clauses: list[str] = []

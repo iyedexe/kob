@@ -175,6 +175,8 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 | `GET /datasets/{name}/facets?columns=a,b[&distinct=true]` | per-column **min/max** (+ approx-distinct) — the per-column filter options |
 | `GET /flight` | the Flight connection URI + how to pull results over it |
 | `POST /query` | run a query interactively → JSON (default) or CSV |
+| `GET /metrics` | timing + counters (JSON): `discover.*` vs `query.*`, cache hit-rate, slowest recent ops |
+| `GET /dashboard` | a live HTML view of `/metrics` — tells you at a glance whether discovery or the query is the slow part |
 
 Swagger UI at `/docs`, ReDoc at `/redoc`, raw schema at `/openapi.json`.
 Append `?refresh=true` to `/datasets` or `/datasets/{name}` to bypass the discovery cache.
@@ -183,11 +185,27 @@ Append `?refresh=true` to `/datasets` or `/datasets/{name}` to bypass the discov
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `KOB_DATA_ROOT` | `./data` | Folder the producer drops Parquet into |
+| `KOB_DATA_ROOT` | `./data` | Folder the producer drops Parquet into — a local path/mount **or** an object-store URL (`s3://`, `az://`, `gs://`, `https://`), read natively via DuckDB (no FUSE mount) |
 | `KOB_DISCOVERY_TTL` | `15` | Seconds to cache discovery before re-scanning |
 | `KOB_DUCKDB_THREADS` | all cores | DuckDB threads |
+| `KOB_MAX_SAMPLE_FILES` | `4` | Parquet footers sampled per dataset at discovery (corruption/schema-evolution robustness) |
+| `KOB_UNION_BY_NAME` | auto | `1`/`0` to force DuckDB `union_by_name`; unset = on only when sampled files disagree (off reads far fewer footers) |
+| `KOB_USE_GLOB` | `0` | `1` = hand DuckDB a glob (live files) instead of the cached, partition-pruned file list |
+| `KOB_MAX_INLINE_FILES` | `8192` | Cap on the explicit file list before falling back to a glob |
+| `KOB_SLOW_MS` | `250` | Ops slower than this are logged loud and flagged on the dashboard |
 
 CLI: `kob --host 0.0.0.0 --flight-port 8815 --http-port 8000 --threads 0`
+
+### Slow on a network share / cloud VM?
+
+Parquet wants cheap random reads; a network share or FUSE object-mount makes every
+footer seek a round-trip. kob avoids the worst of it by **caching the file list** and
+handing DuckDB an **explicit, partition-pruned** set of files (no per-query re-glob),
+and by keeping `union_by_name` **off** for uniform schemas (no all-footers read). If it's
+still slow, open **`/dashboard`** to see whether *discovery* or the *query* dominates, then:
+raise `KOB_DISCOVERY_TTL` (e.g. `600`), set `KOB_MAX_SAMPLE_FILES=1`, **compact** into
+fewer/larger files, and prefer **local NVMe** or a native `s3://`/`az://` URL over a FUSE
+mount.
 
 ## Demos & benchmark
 

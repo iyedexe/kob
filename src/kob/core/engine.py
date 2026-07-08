@@ -22,6 +22,7 @@ import duckdb
 import pyarrow as pa
 
 from .contract import QueryRequest, build_sql
+from .metrics import timed
 
 # Rows per Arrow batch streamed from DuckDB. A few 100k rows keeps each batch in the
 # low-MB range for typical widths — good for streaming + backpressure without tiny chunks.
@@ -47,10 +48,31 @@ def get_connection() -> duckdb.DuckDBPyConnection:
                 conn.execute("SET enable_object_cache = true")
             except duckdb.Error:
                 pass  # setting renamed/removed in some versions — never fatal
+            _load_object_store_extensions(conn)
             # Publish only once fully configured, so a failed SET above can't
             # leave a half-configured connection behind for every later query.
             _conn = conn
         return _conn
+
+
+def _load_object_store_extensions(conn: duckdb.DuckDBPyConnection) -> None:
+    """When KOB_DATA_ROOT is an object-store URL, load httpfs/azure so DuckDB can
+    read s3:// / az:// / https:// natively — far faster than a FUSE mount. Only
+    attempted for URL roots so local startups never pay a network INSTALL. Auth
+    (secrets / env credentials) is DuckDB's own; best-effort here."""
+    from .catalog import IS_URL_ROOT, URL_ROOT
+
+    if not IS_URL_ROOT:
+        return
+    exts = ["httpfs"]
+    if URL_ROOT and URL_ROOT.split("://", 1)[0].lower() in ("az", "azure", "abfs", "abfss"):
+        exts.append("azure")
+    for ext in exts:
+        try:
+            conn.execute(f"INSTALL {ext}")
+            conn.execute(f"LOAD {ext}")
+        except duckdb.Error:
+            pass  # offline / unavailable — the query will surface a clear error
 
 
 def cursor() -> duckdb.DuckDBPyConnection:
@@ -77,9 +99,10 @@ def execute_reader(req: QueryRequest, batch_rows: int = DEFAULT_BATCH_ROWS) -> p
     sql, params = build_sql(req)
     cur = cursor()
     try:
-        cur.execute(sql, params)
-        duck_reader = _arrow_reader(cur, batch_rows)
-        schema = duck_reader.schema
+        with timed("query.execute", req.dataset):
+            cur.execute(sql, params)
+            duck_reader = _arrow_reader(cur, batch_rows)
+            schema = duck_reader.schema
     except Exception:
         cur.close()  # the generator below never runs, so close here
         raise
@@ -102,8 +125,9 @@ def fetch_schema(req: QueryRequest) -> pa.Schema:
     sql, params = build_sql(req)
     cur = cursor()
     try:
-        cur.execute(f"SELECT * FROM ({sql}) AS _schema_probe LIMIT 0", params)
-        return _arrow_reader(cur, 1).schema  # Schema is materialised; safe to close
+        with timed("query.schema", req.dataset):
+            cur.execute(f"SELECT * FROM ({sql}) AS _schema_probe LIMIT 0", params)
+            return _arrow_reader(cur, 1).schema  # Schema is materialised; safe to close
     finally:
         cur.close()
 
@@ -128,12 +152,11 @@ def column_facets(dataset: str, columns: list[str], *, distinct: bool = False) -
         selects.append(f"min({q}) AS mn{i}, max({q}) AS mx{i}")
         if distinct:
             selects.append(f"approx_count_distinct({q}) AS nd{i}")
-    glob = ds.glob.replace("'", "''")
-    sql = (f"SELECT {', '.join(selects)} "
-           f"FROM read_parquet('{glob}', hive_partitioning = true, union_by_name = true)")
+    sql = f"SELECT {', '.join(selects)} FROM {ds.source()}"
     cur = cursor()
     try:
-        row = cur.execute(sql).fetchone()
+        with timed("facets", dataset):
+            row = cur.execute(sql).fetchone()
     finally:
         cur.close()
     out: dict[str, dict] = {}
