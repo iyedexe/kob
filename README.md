@@ -84,6 +84,40 @@ three **core** modules feed every transport:
 One process, one discovery cache, one DuckDB. You don't choose a transport at deploy time —
 you get both, and clients use whichever fits.
 
+## REST mode — `kob --mode rest`
+
+When gRPC isn't an option (proxies, firewalls, browsers, plain-HTTP tooling), run kob as a
+**single HTTP server** that still serves **Apache Arrow**:
+
+```bash
+KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
+#   data + docs      HTTP           http://127.0.0.1:9000/docs
+```
+
+- **Swagger generated from your data.** Every discovered dataset gets its own section with
+  typed endpoints: `GET /data/{dataset}` has one query parameter per column — partition keys
+  and string columns are multi-select pickers (`IN`), numeric/date columns get `col` (exact)
+  and `col.min` / `col.max` (range), `columns` is an enum of the dataset's columns — and
+  `POST /data/{dataset}` takes the usual JSON contract with column names as enums.
+- **Arrow over REST.** Responses are an Arrow IPC stream (`application/vnd.apache.arrow.stream`,
+  `?compression=none|zstd|lz4`). `?format=json|csv` is there for eyeballing results in Swagger.
+- **Manual discovery.** The tree is scanned **once at startup** and then only when you press
+  **Reload datasets** in the Swagger UI (or `POST /reload`). No request ever triggers a tree
+  walk, so a huge data root costs nothing on the hot path. Reload rebuilds the Swagger spec,
+  so new datasets, columns and partition values show up immediately.
+
+```python
+from kob.tools.client import query_rest, query_rest_params, reload_rest
+from kob.core.contract import QueryRequest, Filter
+
+base = "http://127.0.0.1:9000"
+reload_rest(base)                                         # rescan Parquet
+tbl = query_rest(base, QueryRequest(dataset="optionmetrics",
+                                    filters=[Filter("underlying", "in", ["AAPL", "MSFT"])]))
+tbl = query_rest_params(base, "optionmetrics", underlying=["AAPL"],
+                        date__min="2023-03-01", strike__min=100, limit=1000)
+```
+
 ## Project layout
 
 ```
@@ -92,9 +126,10 @@ src/kob/
     catalog.py    filesystem auto-discovery (datasets, partitions, columns)
     contract.py   the JSON query contract + parameterised SQL builder
     engine.py     DuckDB execution → streaming Apache Arrow
-  server/    the `kob` entry point (Flight + Swagger, started together)
+  server/    the `kob` entry point (Flight + Swagger, started together; or --mode rest)
     flight.py     Arrow Flight server (the fast, default data path)
     api.py        FastAPI app: Swagger UI, discovery, /flight how-to, interactive /query
+    rest.py       `--mode rest`: Arrow over HTTP, per-dataset Swagger, manual Reload
     app.py        main(): runs Flight on a thread + the Swagger app in the foreground
   demos/     secondary transports — here only to demonstrate the alternatives
     arrow_http/   Arrow IPC over plain HTTP
@@ -188,6 +223,8 @@ Append `?refresh=true` to `/datasets` or `/datasets/{name}` to bypass the discov
 | `KOB_DUCKDB_THREADS` | all cores | DuckDB threads |
 
 CLI: `kob --host 0.0.0.0 --flight-port 8815 --http-port 8000 --threads 0`
+or `kob --mode rest --host 0.0.0.0 --port 8000` (`KOB_DISCOVERY_TTL` doesn't apply in REST
+mode — discovery there is manual).
 
 ## Demos & benchmark
 

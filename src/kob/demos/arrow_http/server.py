@@ -5,9 +5,8 @@ HTTP. It is here to *demonstrate* the Arrow-over-HTTP option and to give the ben
 target; the product's recommended fast path is Arrow Flight (:mod:`kob.server.flight`),
 which avoids HTTP framing entirely.
 
-A background producer thread writes Arrow batches into a small bounded queue while the
-response generator drains it, so DuckDB scans batch N+1 while batch N is on the wire
-(pipelining), with the queue providing backpressure.
+Streaming is shared with ``kob --mode rest`` (:func:`kob.server.rest.stream_arrow_ipc`):
+a producer thread pipelines DuckDB batches onto the wire through a bounded queue.
 
     python -m kob.demos.arrow_http.server --port 8001
 """
@@ -15,62 +14,15 @@ response generator drains it, so DuckDB scans batch N+1 while batch N is on the 
 from __future__ import annotations
 
 import argparse
-import io
 import os
-import queue
-import threading
 
-import pyarrow as pa
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 
 from ...core import engine
 from ...core.catalog import DATA_ROOT
 from ...core.contract import QueryRequest
-
-ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
-
-
-class _QueueFile(io.RawIOBase):
-    def __init__(self, q: "queue.Queue[bytes | None]") -> None:
-        self._q = q
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, b) -> int:  # type: ignore[override]
-        self._q.put(bytes(b))
-        return len(b)
-
-
-def _stream_arrow(reader: pa.RecordBatchReader, compression: str | None):
-    comp = None if compression in (None, "none", "") else compression
-    opts = pa.ipc.IpcWriteOptions(compression=comp)
-    q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=16)
-
-    def produce() -> None:
-        try:
-            sink = pa.output_stream(_QueueFile(q))
-            writer = pa.ipc.new_stream(sink, reader.schema, options=opts)
-            for batch in reader:
-                writer.write_batch(batch)
-                sink.flush()
-            writer.close()
-            sink.close()
-        except Exception:  # noqa: BLE001 — a truncated stream signals the error to the client
-            pass
-        q.put(None)
-
-    threading.Thread(target=produce, daemon=True).start()
-
-    def consume():
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            yield item
-
-    return consume()
+from ...server.rest import ARROW_STREAM_MIME, stream_arrow_ipc
 
 
 def create_app() -> FastAPI:
@@ -91,7 +43,7 @@ def create_app() -> FastAPI:
         except (ValueError, TypeError) as exc:
             raise HTTPException(400, str(exc)) from None
         return StreamingResponse(
-            _stream_arrow(reader, compression),
+            stream_arrow_ipc(reader, compression),
             media_type=ARROW_STREAM_MIME,
             headers={"X-KOB-Compression": compression},
         )

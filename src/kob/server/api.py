@@ -64,6 +64,31 @@ def _csv_bytes(reader: pa.RecordBatchReader) -> bytes:
     return buf.getvalue().to_pybytes()
 
 
+def dataset_facets(name: str, columns: str, distinct: bool) -> dict:
+    """Facets for a comma-separated column list: partitions from folder names, data columns via DuckDB."""
+    try:
+        ds = get_dataset(name)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    wanted = [c.strip() for c in columns.split(",") if c.strip()]
+    out: dict[str, dict] = {}
+    data_cols = []
+    for c in wanted:
+        if c in ds.partition_cols:
+            # Partition filters come straight from the folder names — free, no scan.
+            out[c] = {"type": "partition", "values": ds.partition_values.get(c, [])}
+        elif c in ds.allowed_columns:
+            data_cols.append(c)
+        else:
+            raise HTTPException(400, f"Unknown column '{c}' for dataset '{name}'")
+    if data_cols:
+        try:
+            out.update(engine.column_facets(name, data_cols, distinct=distinct))
+        except duckdb.Error as exc:
+            raise HTTPException(400, f"Facet query failed: {exc}") from None
+    return {"dataset": name, "facets": out}
+
+
 # --------------------------------------------------------------------------- #
 # Request models — typed so Swagger documents the body and "Try it out" works
 # --------------------------------------------------------------------------- #
@@ -156,27 +181,7 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
         columns: str = Query(..., description="Comma-separated columns."),
         distinct: bool = False,
     ) -> dict:
-        try:
-            ds = get_dataset(name)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from None
-        wanted = [c.strip() for c in columns.split(",") if c.strip()]
-        out: dict[str, dict] = {}
-        data_cols = []
-        for c in wanted:
-            if c in ds.partition_cols:
-                # Partition filters come straight from the folder names — free, no scan.
-                out[c] = {"type": "partition", "values": ds.partition_values.get(c, [])}
-            elif c in ds.allowed_columns:
-                data_cols.append(c)
-            else:
-                raise HTTPException(400, f"Unknown column '{c}' for dataset '{name}'")
-        if data_cols:
-            try:
-                out.update(engine.column_facets(name, data_cols, distinct=distinct))
-            except duckdb.Error as exc:
-                raise HTTPException(400, f"Facet query failed: {exc}") from None
-        return {"dataset": name, "facets": out}
+        return dataset_facets(name, columns, distinct)
 
     @app.get("/flight", tags=["Flight"], summary="How to pull results over Arrow Flight (the fast path)")
     def flight_info() -> dict:

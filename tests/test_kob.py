@@ -188,6 +188,68 @@ def test_stream_json_nan_inf_are_null():
     assert all(v is None or math.isfinite(v) for v in vals)
 
 
+# --------------------------------------------------------------------------- #
+# REST mode (manual discovery, per-dataset OpenAPI, Arrow IPC)
+# --------------------------------------------------------------------------- #
+def test_manual_discovery_only_changes_on_rescan():
+    _reset("manual")
+    _write("manual/k=a/p.parquet", pa.table({"x": [1]}))
+    try:
+        assert "manual" in [d.name for d in catalog.rescan()]
+        _write("manual2/p.parquet", pa.table({"y": [1]}))
+        assert "manual2" not in catalog.list_dataset_names(), "manual mode walked the tree"
+        try:
+            catalog.get_dataset("manual2")
+            raise AssertionError("expected KeyError before rescan")
+        except KeyError:
+            pass
+        catalog.rescan()
+        assert catalog.get_dataset("manual2").data_columns == {"y": "int64"}
+    finally:
+        catalog.enable_auto_discovery()
+        _reset("manual2")
+
+
+def test_rest_query_params_and_openapi():
+    from kob.server.rest import create_rest_app, request_from_query_params
+
+    _reset("restds")
+    _write("restds/region=eu/p.parquet", pa.table({"amount": [1.0, 5.0], "n": [1, 2], "ok": [True, False]}))
+    _write("restds/region=us/p.parquet", pa.table({"amount": [9.0], "n": [3], "ok": [True]}))
+    try:
+        app = create_rest_app()
+        spec = app.openapi()
+        get = spec["paths"]["/data/restds"]["get"]
+        names = {p["name"]: p for p in get["parameters"]}
+        assert names["region"]["schema"]["items"]["enum"] == ["eu", "us"]
+        assert {"amount.min", "amount.max", "n", "ok", "columns", "limit"} <= set(names)
+        assert "amount" not in names  # no exact-match param on floats
+
+        ds = catalog.get_dataset("restds")
+        req = request_from_query_params(ds, [
+            ("columns", "amount,region"), ("region", "eu"), ("amount.min", "2"),
+            ("ok", "false"), ("filter", "n:in:1,2"), ("limit", "10"), ("format", "arrow")])
+        out = engine.execute_reader(req).read_all()
+        assert out.column_names == ["amount", "region"] and out["amount"].to_pylist() == [5.0]
+        try:
+            request_from_query_params(ds, [("bogus", "1")])
+            raise AssertionError("expected ValueError for an unknown parameter")
+        except ValueError:
+            pass
+    finally:
+        catalog.enable_auto_discovery()
+
+
+def test_arrow_ipc_stream_round_trips():
+    from kob.server.rest import stream_arrow_ipc
+
+    _events2()
+    for comp in ("none", "zstd"):
+        payload = b"".join(stream_arrow_ipc(engine.execute_reader(QueryRequest(dataset="events2")), comp))
+        table = pa.ipc.open_stream(payload).read_all()
+        assert table.num_rows == 1 and "amount" in table.column_names
+
+
 if __name__ == "__main__":
     failures = 0
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

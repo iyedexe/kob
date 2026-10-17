@@ -17,6 +17,11 @@ Discovery is cached with a short TTL so freshly-dropped files/partitions appear 
 a restart, while steady-state lookups are a single dict hit (all derived lookups are
 precomputed at discovery time).
 
+**Manual mode** (used by ``kob --mode rest``): :func:`rescan` takes one snapshot of the
+whole tree and from then on lookups are served from it only — no TTL, no tree walks on
+the request path. The tree is re-walked only when :func:`rescan` is called again (the
+Swagger "Reload" button). :func:`enable_auto_discovery` switches back to TTL mode.
+
 Security: a dataset name is always a single path segment that must resolve *inside*
 the data root, and only names found by discovery are accepted — there is no way to
 escape the root via ``..`` or absolute paths.
@@ -181,6 +186,10 @@ def _safe_dataset_path(name: str) -> Path | None:
 # --------------------------------------------------------------------------- #
 _lock = threading.Lock()
 _cache: dict[str, Dataset] = {}
+# When not None, discovery is manual: lookups are served from this snapshot only and
+# the filesystem is walked again only by rescan().
+_snapshot: dict[str, Dataset] | None = None
+_snapshot_at: float | None = None  # wall-clock time of the last rescan()
 
 
 def _fresh(ds: Dataset) -> bool:
@@ -188,6 +197,13 @@ def _fresh(ds: Dataset) -> bool:
 
 
 def get_dataset(name: str, *, refresh: bool = False) -> Dataset:
+    snap = _snapshot
+    if snap is not None:  # manual mode: never touch the filesystem (refresh is ignored)
+        try:
+            return snap[name]
+        except KeyError:
+            raise KeyError(f"Unknown dataset '{name}' (not in the last scan of {DATA_ROOT}; "
+                           "reload to rescan)") from None
     with _lock:
         cached = _cache.get(name)
         if cached is not None and not refresh and _fresh(cached):
@@ -206,6 +222,9 @@ def get_dataset(name: str, *, refresh: bool = False) -> Dataset:
 
 def list_dataset_names(*, refresh: bool = False) -> list[str]:
     """Top-level folders under the data root that contain at least one Parquet file."""
+    snap = _snapshot
+    if snap is not None:
+        return sorted(snap)
     if not DATA_ROOT.is_dir():
         return []
     names = []
@@ -221,3 +240,42 @@ def list_dataset_names(*, refresh: bool = False) -> list[str]:
 
 def list_datasets(*, refresh: bool = False) -> list[Dataset]:
     return [get_dataset(n) for n in list_dataset_names(refresh=refresh)]
+
+
+# --------------------------------------------------------------------------- #
+# Manual discovery (snapshot) mode
+# --------------------------------------------------------------------------- #
+def rescan() -> list[Dataset]:
+    """Walk the whole data root once and serve lookups from that snapshot only.
+
+    Calling this switches the catalog into manual mode (if it was not already). The new
+    snapshot is built off-lock and swapped in atomically, so in-flight requests keep
+    seeing a consistent catalog while the walk runs.
+    """
+    global _snapshot, _snapshot_at
+    found: dict[str, Dataset] = {}
+    if DATA_ROOT.is_dir():
+        for entry in os.scandir(DATA_ROOT):
+            if entry.is_dir():
+                ds = _discover(entry.name)
+                if ds is not None:
+                    found[entry.name] = ds
+    with _lock:
+        _snapshot = found
+        _snapshot_at = time.time()
+        _cache.clear()
+    return [found[n] for n in sorted(found)]
+
+
+def last_scan_time() -> float | None:
+    """Unix time of the last :func:`rescan`, or None in automatic (TTL) mode."""
+    return _snapshot_at if _snapshot is not None else None
+
+
+def enable_auto_discovery() -> None:
+    """Leave manual mode: back to TTL-cached, on-demand discovery."""
+    global _snapshot, _snapshot_at
+    with _lock:
+        _snapshot = None
+        _snapshot_at = None
+        _cache.clear()
