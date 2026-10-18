@@ -63,10 +63,9 @@ class Dataset:
     allowed_columns: frozenset[str]          # precomputed: hot path for filter validation
     file_count: int
     discovered_at: float
-    # Columns usable for a start/end date range (date/timestamp data columns, plus partition
-    # keys whose folder values are ISO dates), and the default one picked for `start`/`end`.
+    # Columns usable in a start/end date range: date/timestamp data columns, plus partition
+    # keys whose folder values are ISO dates. Requests always name the column explicitly.
     date_columns: tuple[str, ...] = ()
-    date_column: str | None = None
 
     @property
     def glob(self) -> str:
@@ -83,7 +82,6 @@ class Dataset:
                 for k in self.partition_cols
             ],
             "data_columns": [{"name": c, "type": t} for c, t in self.data_columns.items()],
-            "date_column": self.date_column,
             "date_columns": list(self.date_columns),
         }
 
@@ -108,24 +106,17 @@ def _friendly(t: pa.DataType) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Date column detection (for start/end range queries)
+# Date columns (usable in start/end range queries)
 # --------------------------------------------------------------------------- #
-# Preferred names for the default date column, most specific first; otherwise the first
-# date/timestamp column in schema order wins.
-_DATE_NAME_PREFERENCE = ("date", "as_of_date", "asof_date", "trade_date", "value_date",
-                         "price_date", "effective_date", "dt", "timestamp", "ts")
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _date_columns(data_columns: dict[str, str], part_keys: list[str],
-                  part_values: dict[str, set[str]]) -> tuple[tuple[str, ...], str | None]:
+                  part_values: dict[str, set[str]]) -> tuple[str, ...]:
     cols = [c for c, t in data_columns.items() if t in ("date", "timestamp")]
     cols += [k for k in part_keys
              if part_values.get(k) and all(_ISO_DATE.match(v) for v in part_values[k])]
-    by_lower = {c.lower(): c for c in cols}
-    default = next((by_lower[n] for n in _DATE_NAME_PREFERENCE if n in by_lower),
-                   cols[0] if cols else None)
-    return tuple(cols), default
+    return tuple(cols)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +173,7 @@ def _discover(name: str) -> Dataset | None:
     columns = dict(data_columns)
     for k in part_keys:
         columns.setdefault(k, "string")  # Hive keys arrive as strings (DuckDB re-infers)
-    date_columns, date_column = _date_columns(data_columns, part_keys, part_values)
+    date_columns = _date_columns(data_columns, part_keys, part_values)
     return Dataset(
         name=name,
         root=root,
@@ -194,7 +185,6 @@ def _discover(name: str) -> Dataset | None:
         file_count=file_count,
         discovered_at=time.monotonic(),
         date_columns=date_columns,
-        date_column=date_column,
     )
 
 

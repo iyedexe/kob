@@ -105,8 +105,8 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
 - **Swagger generated from your data.** Every discovered dataset gets its own section with
   typed endpoints. `GET /data/{dataset}` has one query parameter per column:
   - partition keys and string columns → multi-select pickers (`IN`), filled with real values;
-  - date/timestamp columns → `col.start` / `col.end` (inclusive range), plus `start` / `end`
-    as a shorthand for the dataset's main date column;
+  - date/timestamp columns → `col.start` / `col.end` (inclusive range — the column is always
+    named explicitly, there is no implicit "main" date column);
   - numeric columns → `col` (exact, integers) and `col.min` / `col.max` (range);
   - `columns` (projection, an enum of the dataset's columns), `filter` (`col:op:value`), `limit`.
 
@@ -127,7 +127,7 @@ reload_rest(base)                                         # rescan Parquet
 tbl = query_rest(base, QueryRequest(dataset="optionmetrics",
                                     filters=[Filter("underlying", "in", ["AAPL", "MSFT"])]))
 tbl = query_rest_params(base, "optionmetrics", underlying=["AAPL"],
-                        start="2023-03-01", end="2023-03-31", strike__min=100)
+                        date__start="2023-03-01", date__end="2023-03-31", strike__min=100)
 tbl = query_rest(base, QueryRequest(dataset="dividends", ranges={
           "ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
           "pay_date": {"end": "2024-06-30"}}))
@@ -236,16 +236,14 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 ```
 
 - **Operators:** `= != <> < <= > >= like "not like" ilike in "not in"`.
-- **Date range:** `"start": "2024-01-01", "end": "2024-03-31"` (both inclusive) filters the
-  dataset's date column. kob picks it at discovery (a column named `date`, `trade_date`,
-  `as_of_date`, … or the first date/timestamp column; a `dt=2024-01-01` folder also counts),
-  shown as `date_column` in `GET /datasets/{name}`. Pass `"date_column": "ex_date"` to use
-  another one. A date-only `end` on a timestamp column covers that whole day.
-- **Ranges on any date column:** every date/timestamp column (listed as `date_columns`) can
-  take its own start/end, several at once (AND-ed), either side optional:
+- **Date ranges — always on a named column:** `ranges` maps a date column to an inclusive
+  start/end; several columns at once are AND-ed and either side may be omitted:
   `"ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}, "pay_date": {"end": "2024-06-30"}}`.
-  In REST mode the GET form has `ex_date.start` / `ex_date.end` for each date column; the CLI
-  takes `--range ex_date=2024-01-01..2024-03-31`.
+  Date columns are the date/timestamp columns plus `dt=2024-01-01`-style folders, listed as
+  `date_columns` in `GET /datasets/{name}`; a range on any other column is a 400. There is no
+  implicit default column (a bare top-level `start` / `end` is rejected, never ignored). A
+  date-only `end` on a timestamp column covers that whole day. REST GET:
+  `?ex_date.start=2024-01-01&ex_date.end=2024-03-31`; CLI: `--range ex_date=2024-01-01..2024-03-31`.
 - **Filters** may target data columns **or** partition keys — partition filters prune whole
   folders before any file is read.
 - For large or latency-sensitive pulls, use **Flight**; the HTTP `/query` is for

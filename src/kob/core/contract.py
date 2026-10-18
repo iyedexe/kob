@@ -11,13 +11,12 @@
         {"column": "region", "op": "in", "value": ["eu", "us"]},   # partition (folder) filter
         {"column": "amount", "op": ">=", "value": 100.0}           # data column filter
       ],
-      "start": "2026-06-01", "end": "2026-06-30",         # optional, inclusive date range
+      "ranges": {"dt": {"start": "2026-06-01", "end": "2026-06-30"}},  # optional date ranges
       "limit": 1000000                                    # optional
     }
 
-`start` / `end` filter the dataset's date column (auto-detected at discovery, e.g. ``date``
-or ``trade_date``; override with ``"date_column"``). ``ranges`` gives a start/end to *any*
-date/timestamp column, several at once (AND-ed)::
+``ranges`` gives an inclusive start/end to date/timestamp columns, always named explicitly
+(several at once, AND-ed)::
 
     "ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
                "pay_date": {"end": "2024-06-30"}}
@@ -59,14 +58,16 @@ class QueryRequest:
     columns: list[str] | None = None
     filters: list[Filter] = field(default_factory=list)
     limit: int | None = None
-    start: str | None = None        # inclusive ISO date/datetime on the date column
-    end: str | None = None          # inclusive ISO date/datetime on the date column
-    date_column: str | None = None  # defaults to the dataset's detected date column
     # Any date column -> {"start": iso, "end": iso} (either key optional), AND-ed.
     ranges: dict[str, dict[str, str | None]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "QueryRequest":
+        legacy = [k for k in ("start", "end", "date_column") if d.get(k) is not None]
+        if legacy:
+            # Never silently drop a date bound (that would return the whole history).
+            raise ValueError(f"{legacy} are not supported: name the date column explicitly, "
+                             'e.g. "ranges": {"date": {"start": "2024-01-01", "end": "2024-03-31"}}')
         raw_filters = d.get("filters") or []
         filters: list[Filter] = []
         for f in raw_filters:
@@ -80,9 +81,6 @@ class QueryRequest:
             columns=d.get("columns"),
             filters=filters,
             limit=int(limit) if limit is not None else None,
-            start=_iso_or_none(d.get("start")),
-            end=_iso_or_none(d.get("end")),
-            date_column=d.get("date_column") or None,
             ranges=_ranges_from(d.get("ranges")),
         )
 
@@ -92,9 +90,6 @@ class QueryRequest:
             "columns": self.columns,
             "filters": [{"column": f.column, "op": f.op, "value": f.value} for f in self.filters],
             "limit": self.limit,
-            "start": self.start,
-            "end": self.end,
-            "date_column": self.date_column,
             "ranges": self.ranges,
         }
 
@@ -156,11 +151,6 @@ def _range_bounds(ds: Dataset, col: str, start_raw: str | None,
 def _date_ranges(req: QueryRequest, ds: Dataset) -> list[tuple[str, str, Any]]:
     """All date-range bounds of a request as ``(column, sql_op, value)``."""
     out: list[tuple[str, str, Any]] = []
-    if req.start is not None or req.end is not None:
-        col = req.date_column or ds.date_column
-        if col is None:
-            raise ValueError(f"Dataset '{ds.name}' has no date/timestamp column; start/end need one")
-        out += [(col, op, v) for op, v in _range_bounds(ds, col, req.start, req.end)]
     for col, b in req.ranges.items():
         out += [(col, op, v) for op, v in _range_bounds(ds, col, b.get("start"), b.get("end"))]
     return out
@@ -195,9 +185,6 @@ def _validate(req: QueryRequest) -> Dataset:
                 f"Operator {f.op!r} on {f.column!r} requires a list of values, "
                 f'e.g. {{"column": "{f.column}", "op": "{f.op}", "value": ["a", "b"]}}'
             )
-    if req.date_column is not None and req.date_column not in ds.date_columns:
-        raise ValueError(f"date_column must be one of {list(ds.date_columns)} for '{ds.name}', "
-                         f"got {req.date_column!r}")
     if req.limit is not None and not (0 < req.limit <= MAX_LIMIT):
         raise ValueError(f"limit must be in (0, {MAX_LIMIT}]")
     return ds
