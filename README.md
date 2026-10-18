@@ -280,7 +280,7 @@ written to a staging folder outside the data root and moved in when complete, so
 
 | dataset | rows (default range) | span | columns | partitions | source (licence) |
 |---|---:|---|---|---|---|
-| `uk_house_prices` | 28.1M (all years, ~1 min) | 1995 → 2023 | date, price, postcode, type, is_new, duration, addr1, addr2, street, locality, town, district, county | `year` | HM Land Registry Price Paid (Open Government Licence v3.0 — attribution required) |
+| `uk_house_prices` | 28.1M (all years, ~1 min) | 1995 → 2023-02 | date, price, postcode, type, is_new, duration, addr1, addr2, street, locality, town, district, county | `year` | HM Land Registry Price Paid (Open Government Licence v3.0 — attribution required) |
 | `crypto_klines_1m` | ~5M (10 symbols x 12 months) | 2017 → last month | open_time, close_time (UTC), open, high, low, close, volume, quote_volume, trades, taker_buy_* | `symbol`, `year` | Binance public market data (see Binance's terms) |
 | `forex_ticks` | 70–145M per month (default 2022-08: 144.5M, ~30 s) | 2000-05 → 2022-08 | datetime (UTC), bid, ask, base, quote | `pair`, `year` | histdata.com ticks, hosted by ClickHouse (check histdata's terms) |
 

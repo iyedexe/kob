@@ -511,7 +511,7 @@ DATASETS: dict[str, Spec] = {
     "sp500_monthly": Spec("core", "<1 MB", "Shiller S&P level/dividend/earnings, 1871-", _core_fetch("sp500_monthly")),
     "vix_daily": Spec("core", "<1 MB", "VIX daily OHLC, 1990-today", _core_fetch("vix_daily")),
     "brent_daily": Spec("core", "<1 MB", "Brent crude daily, 1987-today", _core_fetch("brent_daily")),
-    "uk_house_prices": Spec("heavy", "0.7 GB, ~30M rows (all years)", "UK property sales, 1995-2023 (--from/--to years)", fetch_uk_house_prices),
+    "uk_house_prices": Spec("heavy", "0.7 GB, 28M rows (all years)", "UK property sales, 1995 -> 2023-02 (--from/--to years)", fetch_uk_house_prices),
     "crypto_klines_1m": Spec("heavy", "~44k rows per symbol-month", "Binance 1m candles (--symbols, --from/--to; default 10 symbols x last 12 months)", fetch_crypto_klines_1m),
     "forex_ticks": Spec("heavy", "~0.6-1.2 GB, 70-145M rows per month", "FX bid/ask ticks, 66 pairs, 2000-05..2022-08 (--from/--to; default 2022-08)", fetch_forex_ticks),
 }
