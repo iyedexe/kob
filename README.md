@@ -95,7 +95,8 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
 ```
 
 - **Swagger generated from your data.** Every discovered dataset gets its own section with
-  typed endpoints: `GET /data/{dataset}` has one query parameter per column — partition keys
+  typed endpoints: `GET /data/{dataset}` has `start` / `end` for a date range, plus one
+  query parameter per column — partition keys
   and string columns are multi-select pickers (`IN`), numeric/date columns get `col` (exact)
   and `col.min` / `col.max` (range), `columns` is an enum of the dataset's columns — and
   `POST /data/{dataset}` takes the usual JSON contract with column names as enums.
@@ -115,7 +116,7 @@ reload_rest(base)                                         # rescan Parquet
 tbl = query_rest(base, QueryRequest(dataset="optionmetrics",
                                     filters=[Filter("underlying", "in", ["AAPL", "MSFT"])]))
 tbl = query_rest_params(base, "optionmetrics", underlying=["AAPL"],
-                        date__min="2023-03-01", strike__min=100, limit=1000)
+                        start="2023-03-01", end="2023-03-31", strike__min=100)
 ```
 
 ## Project layout
@@ -195,6 +196,11 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 ```
 
 - **Operators:** `= != <> < <= > >= like "not like" ilike in "not in"`.
+- **Date range:** `"start": "2024-01-01", "end": "2024-03-31"` (both inclusive) filters the
+  dataset's date column. kob picks it at discovery (a column named `date`, `trade_date`,
+  `as_of_date`, … or the first date/timestamp column; a `dt=2024-01-01` folder also counts),
+  shown as `date_column` in `GET /datasets/{name}`. Pass `"date_column": "ex_date"` to use
+  another one. A date-only `end` on a timestamp column covers that whole day.
 - **Filters** may target data columns **or** partition keys — partition filters prune whole
   folders before any file is read.
 - For large or latency-sensitive pulls, use **Flight**; the HTTP `/query` is for

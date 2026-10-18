@@ -189,6 +189,63 @@ def test_stream_json_nan_inf_are_null():
 
 
 # --------------------------------------------------------------------------- #
+# start / end date range
+# --------------------------------------------------------------------------- #
+def test_start_end_on_detected_date_column():
+    import datetime as dt
+
+    _reset("closes")
+    days = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(10)]
+    _write("closes/year=2024/p.parquet", pa.table({
+        "listed": [dt.date(2000, 1, 1)] * 10, "trade_date": days, "close": [float(i) for i in range(10)]}))
+    ds = catalog.get_dataset("closes")
+    assert ds.date_column == "trade_date"  # preferred name beats schema order
+    assert set(ds.date_columns) == {"listed", "trade_date"}
+    out = _q(dataset="closes", start="2024-01-03", end="2024-01-05")
+    assert out["close"].to_pylist() == [2.0, 3.0, 4.0]  # both ends inclusive
+    assert _q(dataset="closes", start="2024-01-09").num_rows == 2
+    assert _q(dataset="closes", end="2024-01-01").num_rows == 1
+    assert _q(dataset="closes", start="2000-01-01", end="2000-01-01", date_column="listed").num_rows == 10
+    # round-trips through the JSON contract (Flight / POST)
+    req = QueryRequest.from_dict(QueryRequest(dataset="closes", start="2024-01-02", end="2024-01-02").to_dict())
+    assert engine.execute_reader(req).read_all().num_rows == 1
+    for bad in (dict(start="2024-01-05", end="2024-01-01"), dict(start="not-a-date"),
+                dict(start="2024-01-01", date_column="nope")):
+        try:
+            build_sql(QueryRequest(dataset="closes", **bad))
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+
+
+def test_end_date_covers_whole_day_on_timestamps():
+    import datetime as dt
+
+    _reset("ticks")
+    ts = [dt.datetime(2024, 1, 1, 9), dt.datetime(2024, 1, 1, 17, 30), dt.datetime(2024, 1, 2, 9)]
+    _write("ticks/p.parquet", pa.table({"ts": ts, "px": [1.0, 2.0, 3.0]}))
+    assert catalog.get_dataset("ticks").date_column == "ts"
+    assert _q(dataset="ticks", start="2024-01-01", end="2024-01-01").num_rows == 2
+    assert _q(dataset="ticks", end="2024-01-01T12:00:00").num_rows == 1
+
+
+def test_iso_date_partition_is_a_date_column():
+    _reset("daily")
+    for d in ("2024-01-01", "2024-01-02", "2024-01-03"):
+        _write(f"daily/dt={d}/p.parquet", pa.table({"v": [1]}))
+    ds = catalog.get_dataset("daily")
+    assert ds.date_column == "dt"
+    assert _q(dataset="daily", start="2024-01-02", end="2024-01-03").num_rows == 2
+    _reset("nodates")
+    _write("nodates/p.parquet", pa.table({"v": [1]}))
+    try:
+        build_sql(QueryRequest(dataset="nodates", start="2024-01-01"))
+        raise AssertionError("expected ValueError: no date column")
+    except ValueError as exc:
+        assert "no date" in str(exc)
+
+
+# --------------------------------------------------------------------------- #
 # REST mode (manual discovery, per-dataset OpenAPI, Arrow IPC)
 # --------------------------------------------------------------------------- #
 def test_manual_discovery_only_changes_on_rescan():

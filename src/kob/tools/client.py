@@ -17,6 +17,8 @@ Importable API::
                                     filters=[Filter("region", "=", "eu")]))
     tbl = query_rest("http://127.0.0.1:8000", QueryRequest(dataset="events", limit=10))
     tbl = query_rest_params("http://127.0.0.1:8000", "events", region=["eu", "us"], limit=10)
+    tbl = query_rest("http://127.0.0.1:8000",
+                     QueryRequest(dataset="prices", start="2024-01-01", end="2024-03-31"))
     reload_rest("http://127.0.0.1:8000")      # rescan Parquet on the server
 
 CLI::
@@ -24,6 +26,7 @@ CLI::
     kob-client --dataset events --filter 'region:=:eu' --filter 'amount:>=:100'
     kob-client --transport rest --dataset events --columns user_id,amount --limit 10
     kob-client --transport rest --reload --dataset events      # rescan first, then query
+    kob-client --transport rest --dataset prices --start 2024-01-01 --end 2024-03-31
     kob-client --transport http --dataset events --columns user_id,amount --limit 10
 """
 
@@ -99,7 +102,8 @@ def query_rest_params(base_url: str, dataset: str, *, compression: str = "zstd",
 
     Keyword args map to query parameters: ``region=["eu", "us"]`` (IN),
     ``amount__min=100`` / ``amount__max=500`` (→ ``amount.min`` / ``amount.max``),
-    ``columns=["a", "b"]``, ``filter=["strike:>:100"]``, ``limit=10``.
+    ``columns=["a", "b"]``, ``filter=["strike:>:100"]``, ``start="2024-01-01"``,
+    ``end="2024-03-31"``, ``limit=10``.
     """
     query: list[tuple[str, object]] = [("format", "arrow"), ("compression", compression)]
     for k, v in params.items():
@@ -145,7 +149,8 @@ def _req_from_args(args: argparse.Namespace) -> QueryRequest:
         col, op, val = raw.split(":", 2)
         filters.append(Filter(col, op, _coerce(val)))
     columns = [c.strip() for c in args.columns.split(",")] if args.columns else None
-    return QueryRequest(dataset=args.dataset, columns=columns, filters=filters, limit=args.limit)
+    return QueryRequest(dataset=args.dataset, columns=columns, filters=filters, limit=args.limit,
+                        start=args.start, end=args.end, date_column=args.date_column)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -160,6 +165,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--filter", action="append",
                    help="Filter 'column:op:value' (repeatable), e.g. 'region:=:eu' or 'amount:>=:100'.")
     p.add_argument("--limit", type=int)
+    p.add_argument("--start", help="Inclusive start date (ISO) on the dataset's date column.")
+    p.add_argument("--end", help="Inclusive end date (ISO) on the dataset's date column.")
+    p.add_argument("--date-column", help="Column for --start/--end (default: auto-detected).")
     p.add_argument("--compression", default="zstd", choices=["zstd", "lz4", "none"])
     p.add_argument("--head", type=int, default=5, help="Rows to preview.")
     p.add_argument("--reload", action="store_true",

@@ -34,6 +34,8 @@ uv run kob-client --dataset optionmetrics --filter 'underlying:=:AAPL' --filter 
 uv run kob-client --transport http --port 8001 --dataset georev --filter 'year:=:2023' --columns company_id,region,revenue_usd --limit 5
 # REST mode (start `kob --mode rest` first); --reload rescans the server's Parquet first:
 uv run kob-client --transport rest --reload --dataset georev --filter 'year:=:2023' --limit 5
+# Date range on the dataset's date column (any transport):
+uv run kob-client --dataset optionmetrics --start 2023-03-01 --end 2023-03-31 --limit 5
 ```
 
 Importable API: `from kob.tools.client import query_flight, query_http, query_rest,
