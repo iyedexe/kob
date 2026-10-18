@@ -364,7 +364,46 @@ def test_open_data_builders():
     px, _ = od.build_prices_daily(b"date,open,high,low,close,volume,Name\n"
                                   b"2013-02-08,15.07,15.12,14.63,14.75,8407500,AAL\n")
     assert px.column_names == ["date", "ticker", "open", "high", "low", "close", "volume", "year"]
-    assert od.SOURCES.keys() == od.BUILDERS.keys()
+    assert od.BUILDERS.keys() <= od.SOURCES.keys()
+
+
+def test_get_data_helpers_and_cli():
+    import contextlib
+    import datetime as dt
+    import io as _io
+
+    from kob.server.app import main
+    from kob.tools import open_data as od
+
+    # Binance klines: ms (≤2024) and µs (2025+) timestamps, with or without a header row.
+    row = "{t},100.0,101.0,99.0,100.5,12.5,{c},1256.25,42,6.0,603.0,0\n"
+    ms = row.format(t=1704067200000, c=1704067259999)                    # 2024-01-01 00:00 UTC
+    us = row.format(t=1735689600000000, c=1735689659999999)              # 2025-01-01 00:00 UTC
+    for raw, want in ((ms, dt.datetime(2024, 1, 1)), (us, dt.datetime(2025, 1, 1)),
+                      ("open_time,open,high,low,close,volume,close_time,quote_volume,count,"
+                       "taker_buy_volume,taker_buy_quote_volume,ignore\n" + us, dt.datetime(2025, 1, 1))):
+        t = od.parse_klines(raw.encode())
+        assert t.num_rows == 1 and t["open_time"][0].as_py() == want, t["open_time"][0]
+        assert t["trades"][0].as_py() == 42 and t["close"][0].as_py() == 100.5
+
+    assert od._months("2023-11", "2024-02") == [(2023, 11), (2023, 12), (2024, 1), (2024, 2)]
+    assert od._months("2022", "2022")[-1] == (2022, 12) and len(od._months("2022", "2022")) == 12
+    assert od._shift("2024-01", -1) == "2023-12" and od._shift("2024-12", -11) == "2024-01"
+    assert od.resolve("core") == od.GROUPS["core"]
+    assert od.resolve("forex_ticks,heavy") == ["forex_ticks", "uk_house_prices", "crypto_klines_1m"]
+    assert set(od.DATASETS) <= set(od.SOURCES)
+
+    out = _io.StringIO()
+    with contextlib.redirect_stdout(out):
+        main(["--get-data", "list"])
+    assert "forex_ticks" in out.getvalue() and "groups:" in out.getvalue()
+    for bad in (["--get-data", "nope"], ["--get-data", "core", "--from", "2024/01"]):
+        try:
+            with contextlib.redirect_stderr(_io.StringIO()):
+                main(bad)
+            raise AssertionError(f"expected argparse error for {bad}")
+        except SystemExit as exc:
+            assert exc.code == 2
 
 
 def _free_port() -> int:

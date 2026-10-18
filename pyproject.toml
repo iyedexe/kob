@@ -37,7 +37,6 @@ kob-demo-json = "kob.demos.json.server:main"         # REST/JSON baseline
 kob-demo-proto = "kob.demos.protobuf.server:main"    # [bench]  gRPC/Protobuf baseline
 # Tooling (needs the matching extra):
 kob-gen = "kob.tools.generate_data:main"         # [gen]    sample datasets
-kob-open-data = "kob.tools.open_data:main"       # real open financial datasets (no extra needed)
 kob-client = "kob.tools.client:main"             # [client] reference client
 kob-bench = "kob.tools.benchmark:main"           # [bench]  transport shoot-out
 

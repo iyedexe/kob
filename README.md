@@ -217,7 +217,7 @@ src/kob/
     json/         REST/JSON (the slow, ubiquitous baseline)
     protobuf/     gRPC + Protocol Buffers (row + columnar)
   tools/     optional utilities (most need an install extra)
-    open_data.py       real open financial datasets → Parquet (kob-open-data, no extra)
+    open_data.py       real open datasets → Parquet (`kob --get-data`, no extra)
     generate_data.py   synthetic sample datasets (kob-gen)
     client.py          reference Python client + CLI (kob-client)
     benchmark.py       Flight-vs-HTTP-vs-Protobuf-vs-JSON shoot-out (kob-bench)
@@ -231,22 +231,39 @@ uv sync                                       # or: pip install -e .  (Python �
 KOB_DATA_ROOT=/path/to/parquet uv run kob     # Flight :8815 + Swagger :8000/docs
 ```
 
-No data yet? Grab **real, open financial data** (about 4 s, ~23 MB of Parquet, no extra
-dependencies) and serve it:
+No data yet? Grab **real, open financial data** into the data root and serve it:
 
 ```bash
-uv run kob-open-data                                     # → ./data-open   (or: make open-data)
-KOB_DATA_ROOT=data-open uv run kob --mode rest           # → http://localhost:8000/docs
+uv run kob --get-data                  # core sets: ~25 MB, ~5 s        (or: make get-data)
+uv run kob --get-data all              # + ~60M rows of heavy data     (or: make get-data-heavy)
+uv run kob --mode rest                 # → http://localhost:8000/docs
 ```
 
 Open **http://localhost:8000/docs** — Swagger UI with a working **Try it out** for every
 endpoint. (Synthetic samples are still available: `uv sync --extra gen && uv run kob-gen`.)
 
-## Open datasets
+## Open datasets — `kob --get-data`
 
-`kob-open-data` downloads public CSVs (all hosted on GitHub) and writes them as
-Hive-partitioned Parquet, sorted for range pruning. Sources and licences land in
-`data-open/SOURCES.md`.
+`kob --get-data [SETS]` downloads real, public data and writes it as Hive-partitioned
+Parquet, sorted for range pruning, into the data root kob serves (`KOB_DATA_ROOT`, default
+`./data`) — then exits. Sources and licences land in `<root>/SOURCES.md`. No extra
+dependencies.
+
+```bash
+uv run kob --get-data list                                   # every set, with sizes
+uv run kob --get-data                                        # = core (default)
+uv run kob --get-data heavy                                  # the three heavy sets, default ranges
+uv run kob --get-data crypto_klines_1m --symbols BTCUSDT,ETHUSDT --from 2021-01 --to 2024-12
+uv run kob --get-data forex_ticks --from 2015-01 --to 2015-06   # ~6 x 70M ticks
+uv run kob --get-data uk_house_prices --from 2015                # years 2015..2023
+KOB_DATA_ROOT=/big/disk uv run kob --get-data all
+```
+
+Heavy sets are **resumable** — months/years already on disk are skipped — and each piece is
+written to a staging folder outside the data root and moved in when complete, so a running
+`kob` never sees a half-written partition (press **Reload** in REST mode to pick them up).
+
+### Core sets (public CSVs on GitHub, ~5 s)
 
 | dataset | rows | span | columns | partitions | source (licence) |
 |---|---:|---|---|---|---|
@@ -258,6 +275,17 @@ Hive-partitioned Parquet, sorted for range pruning. Sources and licences land in
 | `sp500_monthly` | 1.9k | 1871 → today | date, sp500, dividend, earnings, cpi, long_interest_rate, real_*, pe10 | — | Robert Shiller via datahub.io (PDDL) |
 | `vix_daily` | 9.3k | 1990 → today | date, open, high, low, close | — | CBOE via datahub.io |
 | `brent_daily` | 9.1k | 1987 → today | date, price | — | US EIA via datahub.io (PDDL) |
+
+### Heavy sets (public S3 buckets, streamed)
+
+| dataset | rows (default range) | span | columns | partitions | source (licence) |
+|---|---:|---|---|---|---|
+| `uk_house_prices` | 28.1M (all years, ~1 min) | 1995 → 2023 | date, price, postcode, type, is_new, duration, addr1, addr2, street, locality, town, district, county | `year` | HM Land Registry Price Paid (Open Government Licence v3.0 — attribution required) |
+| `crypto_klines_1m` | ~5M (10 symbols x 12 months) | 2017 → last month | open_time, close_time (UTC), open, high, low, close, volume, quote_volume, trades, taker_buy_* | `symbol`, `year` | Binance public market data (see Binance's terms) |
+| `forex_ticks` | 70–145M per month (default 2022-08: 144.5M, ~30 s) | 2000-05 → 2022-08 | datetime (UTC), bid, ask, base, quote | `pair`, `year` | histdata.com ticks, hosted by ClickHouse (check histdata's terms) |
+
+Choose ranges with `--from` / `--to` (`YYYY` or `YYYY-MM`) and `--symbols`. The whole forex
+archive is ~11.5 billion ticks / ~550 GB, so pick months deliberately.
 
 ```python
 from kob.tools.client import KobClient
