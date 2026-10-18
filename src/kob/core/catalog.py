@@ -33,7 +33,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyarrow as pa
@@ -63,10 +63,14 @@ class Dataset:
     allowed_columns: frozenset[str]          # precomputed: hot path for filter validation
     file_count: int
     discovered_at: float
-    # Columns usable for a start/end date range (date/timestamp data columns, plus partition
-    # keys whose folder values are ISO dates), and the default one picked for `start`/`end`.
-    date_columns: tuple[str, ...] = ()
-    date_column: str | None = None
+    # Sliceable columns -> kind ("date" | "timestamp" | "number"): the columns a request can
+    # give an inclusive start/end range. Date/timestamp/numeric data columns, plus partition
+    # keys whose folder values are all ISO dates or all integers.
+    sliceable_columns: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def date_columns(self) -> tuple[str, ...]:
+        return tuple(c for c, k in self.sliceable_columns.items() if k in ("date", "timestamp"))
 
     @property
     def glob(self) -> str:
@@ -83,8 +87,7 @@ class Dataset:
                 for k in self.partition_cols
             ],
             "data_columns": [{"name": c, "type": t} for c, t in self.data_columns.items()],
-            "date_column": self.date_column,
-            "date_columns": list(self.date_columns),
+            "sliceable_columns": dict(self.sliceable_columns),
         }
 
 
@@ -108,24 +111,24 @@ def _friendly(t: pa.DataType) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Date column detection (for start/end range queries)
+# Sliceable columns (usable in start/end range queries)
 # --------------------------------------------------------------------------- #
-# Preferred names for the default date column, most specific first; otherwise the first
-# date/timestamp column in schema order wins.
-_DATE_NAME_PREFERENCE = ("date", "as_of_date", "asof_date", "trade_date", "value_date",
-                         "price_date", "effective_date", "dt", "timestamp", "ts")
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_INTEGER = re.compile(r"^-?\d+$")
+_SLICE_KIND = {"date": "date", "timestamp": "timestamp",
+               "int64": "number", "double": "number", "decimal": "number"}
 
 
-def _date_columns(data_columns: dict[str, str], part_keys: list[str],
-                  part_values: dict[str, set[str]]) -> tuple[tuple[str, ...], str | None]:
-    cols = [c for c, t in data_columns.items() if t in ("date", "timestamp")]
-    cols += [k for k in part_keys
-             if part_values.get(k) and all(_ISO_DATE.match(v) for v in part_values[k])]
-    by_lower = {c.lower(): c for c in cols}
-    default = next((by_lower[n] for n in _DATE_NAME_PREFERENCE if n in by_lower),
-                   cols[0] if cols else None)
-    return tuple(cols), default
+def _sliceable_columns(data_columns: dict[str, str], part_keys: list[str],
+                       part_values: dict[str, set[str]]) -> dict[str, str]:
+    out = {c: _SLICE_KIND[t] for c, t in data_columns.items() if t in _SLICE_KIND}
+    for k in part_keys:
+        vals = part_values.get(k)
+        if vals and all(_ISO_DATE.match(v) for v in vals):
+            out[k] = "date"
+        elif vals and all(_INTEGER.match(v) for v in vals):
+            out[k] = "number"  # DuckDB infers integer Hive keys (year=2024) as BIGINT
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +185,7 @@ def _discover(name: str) -> Dataset | None:
     columns = dict(data_columns)
     for k in part_keys:
         columns.setdefault(k, "string")  # Hive keys arrive as strings (DuckDB re-infers)
-    date_columns, date_column = _date_columns(data_columns, part_keys, part_values)
+    sliceable_columns = _sliceable_columns(data_columns, part_keys, part_values)
     return Dataset(
         name=name,
         root=root,
@@ -193,8 +196,7 @@ def _discover(name: str) -> Dataset | None:
         allowed_columns=frozenset(columns),
         file_count=file_count,
         discovered_at=time.monotonic(),
-        date_columns=date_columns,
-        date_column=date_column,
+        sliceable_columns=sliceable_columns,
     )
 
 

@@ -104,17 +104,11 @@ class QueryModel(BaseModel):
     filters: list[FilterModel] = Field(
         default_factory=list, description="AND-ed; may target data columns or partition (folder) keys.")
     limit: int | None = Field(None, ge=1, description="Optional row cap.")
-    start: str | None = Field(None, description="Inclusive start (ISO date/datetime) on the date column.",
-                              examples=["2026-06-01"])
-    end: str | None = Field(None, description="Inclusive end (ISO date/datetime) on the date column.",
-                            examples=["2026-06-30"])
-    date_column: str | None = Field(
-        None, description="Column for start/end; defaults to the dataset's detected date column "
-                          "(see `date_column` in GET /datasets/{name}).")
-    ranges: dict[str, dict[str, str | None]] = Field(
+    ranges: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
-        description="Inclusive start/end on any date column (see `date_columns` in "
-                    "GET /datasets/{name}), AND-ed; either side optional.",
+        description="Inclusive start/end per sliceable (date/timestamp/numeric) column, named "
+                    "explicitly (see `sliceable_columns` in GET /datasets/{name}); AND-ed; "
+                    "either side optional.",
         examples=[{"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}}])
 
     model_config = {

@@ -34,14 +34,21 @@ uv run kob-client --dataset optionmetrics --filter 'underlying:=:AAPL' --filter 
 uv run kob-client --transport http --port 8001 --dataset georev --filter 'year:=:2023' --columns company_id,region,revenue_usd --limit 5
 # REST mode (start `kob --mode rest` first); --reload rescans the server's Parquet first:
 uv run kob-client --transport rest --reload --dataset georev --filter 'year:=:2023' --limit 5
-# Date range on the dataset's date column (any transport):
-uv run kob-client --dataset optionmetrics --start 2023-03-01 --end 2023-03-31 --limit 5
-# Ranges on any date column(s), either side optional:
+# Date ranges, always on a named date column (repeatable, either side optional; any transport):
 uv run kob-client --dataset optionmetrics --range date=2023-03-01..2023-03-31 --range expiry=..2023-04-30 --limit 5
 ```
 
-Importable API: `from kob.tools.client import query_flight, query_http, query_rest,
-query_rest_params, reload_rest`.
+Python API (Flight or REST, picked from the URL) — slices are inclusive at both ends:
+
+```python
+from kob.tools.client import KobClient
+
+om = KobClient("grpc://127.0.0.1:8815")["optionmetrics"]   # or "http://127.0.0.1:8000"
+tbl = om.query(om.date["2023-03-01":"2023-03-31"], om.strike[90:110], underlying=["AAPL"])
+```
+
+Lower level: `query_flight`, `query_rest`, `query_http`, `reload_rest` take a `QueryRequest`.
+Full query reference (Python, JSON, REST GET, CLI): [`docs/QUERYING.md`](../docs/QUERYING.md).
 
 ## C# / .NET  (`clients/csharp/`)
 

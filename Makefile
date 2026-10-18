@@ -11,8 +11,8 @@ help:
 setup:           ## Install the minimal core server (4 deps)
 	uv sync
 
-test:            ## Run the test suite (core deps only, no framework)
-	uv run python tests/test_kob.py
+test:            ## Run the test suite (no framework; [client] extra enables the end-to-end test)
+	uv run --extra client python tests/test_kob.py
 
 data-small:      ## Generate the small sample dataset (needs [gen])
 	uv run --extra gen kob-gen --scale small

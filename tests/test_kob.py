@@ -1,10 +1,11 @@
 """kob test suite — plain Python, no test-framework dependency.
 
-Run:   python tests/test_kob.py      (or: pytest tests/test_kob.py)
+Run:   make test   (= uv run --extra client python tests/test_kob.py; pytest works too)
 
 Each test builds a throwaway Parquet tree under a tmp dir and points the catalog
-at it, exercising discovery, the query contract, the engine, and the JSON edge
-cases end to end (no servers are started).
+at it, exercising discovery, the query contract, ranges, the engine, REST mode and
+the JSON edge cases. `test_end_to_end_rest_and_flight_servers` starts real REST and
+Flight servers in-process (skipped without the [client] extra).
 """
 from __future__ import annotations
 
@@ -191,7 +192,7 @@ def test_stream_json_nan_inf_are_null():
 # --------------------------------------------------------------------------- #
 # start / end date range
 # --------------------------------------------------------------------------- #
-def test_start_end_on_detected_date_column():
+def test_date_range_is_inclusive_and_explicit():
     import datetime as dt
 
     _reset("closes")
@@ -199,23 +200,30 @@ def test_start_end_on_detected_date_column():
     _write("closes/year=2024/p.parquet", pa.table({
         "listed": [dt.date(2000, 1, 1)] * 10, "trade_date": days, "close": [float(i) for i in range(10)]}))
     ds = catalog.get_dataset("closes")
-    assert ds.date_column == "trade_date"  # preferred name beats schema order
     assert set(ds.date_columns) == {"listed", "trade_date"}
-    out = _q(dataset="closes", start="2024-01-03", end="2024-01-05")
-    assert out["close"].to_pylist() == [2.0, 3.0, 4.0]  # both ends inclusive
-    assert _q(dataset="closes", start="2024-01-09").num_rows == 2
-    assert _q(dataset="closes", end="2024-01-01").num_rows == 1
-    assert _q(dataset="closes", start="2000-01-01", end="2000-01-01", date_column="listed").num_rows == 10
-    # round-trips through the JSON contract (Flight / POST)
-    req = QueryRequest.from_dict(QueryRequest(dataset="closes", start="2024-01-02", end="2024-01-02").to_dict())
-    assert engine.execute_reader(req).read_all().num_rows == 1
-    for bad in (dict(start="2024-01-05", end="2024-01-01"), dict(start="not-a-date"),
-                dict(start="2024-01-01", date_column="nope")):
+    assert "date_column" not in ds.to_public_dict()  # no implicit default column
+    r = lambda **b: {"trade_date": b}  # noqa: E731
+    assert _q(dataset="closes", ranges=r(start="2024-01-03", end="2024-01-05"))["close"].to_pylist() \
+        == [2.0, 3.0, 4.0]  # both ends inclusive
+    assert _q(dataset="closes", ranges=r(start="2024-01-09")).num_rows == 2
+    assert _q(dataset="closes", ranges=r(end="2024-01-01")).num_rows == 1
+    assert _q(dataset="closes", ranges={"listed": {"start": "2000-01-01", "end": "2000-01-01"}}).num_rows == 10
+    for bad in (r(start="2024-01-05", end="2024-01-01"), r(start="not-a-date")):
         try:
-            build_sql(QueryRequest(dataset="closes", **bad))
+            build_sql(QueryRequest(dataset="closes", ranges=bad))
             raise AssertionError(f"expected ValueError for {bad}")
         except ValueError:
             pass
+
+
+def test_top_level_start_end_rejected_not_ignored():
+    # A dropped date bound would silently return the whole history — must be an error.
+    for legacy in ({"start": "2024-01-01"}, {"end": "2024-01-01"}, {"date_column": "trade_date"}):
+        try:
+            QueryRequest.from_dict({"dataset": "closes", **legacy})
+            raise AssertionError(f"expected ValueError for {legacy}")
+        except ValueError as exc:
+            assert "ranges" in str(exc)
 
 
 def test_end_date_covers_whole_day_on_timestamps():
@@ -224,25 +232,16 @@ def test_end_date_covers_whole_day_on_timestamps():
     _reset("ticks")
     ts = [dt.datetime(2024, 1, 1, 9), dt.datetime(2024, 1, 1, 17, 30), dt.datetime(2024, 1, 2, 9)]
     _write("ticks/p.parquet", pa.table({"ts": ts, "px": [1.0, 2.0, 3.0]}))
-    assert catalog.get_dataset("ticks").date_column == "ts"
-    assert _q(dataset="ticks", start="2024-01-01", end="2024-01-01").num_rows == 2
-    assert _q(dataset="ticks", end="2024-01-01T12:00:00").num_rows == 1
+    assert _q(dataset="ticks", ranges={"ts": {"start": "2024-01-01", "end": "2024-01-01"}}).num_rows == 2
+    assert _q(dataset="ticks", ranges={"ts": {"end": "2024-01-01T12:00:00"}}).num_rows == 1
 
 
 def test_iso_date_partition_is_a_date_column():
     _reset("daily")
     for d in ("2024-01-01", "2024-01-02", "2024-01-03"):
         _write(f"daily/dt={d}/p.parquet", pa.table({"v": [1]}))
-    ds = catalog.get_dataset("daily")
-    assert ds.date_column == "dt"
-    assert _q(dataset="daily", start="2024-01-02", end="2024-01-03").num_rows == 2
-    _reset("nodates")
-    _write("nodates/p.parquet", pa.table({"v": [1]}))
-    try:
-        build_sql(QueryRequest(dataset="nodates", start="2024-01-01"))
-        raise AssertionError("expected ValueError: no date column")
-    except ValueError as exc:
-        assert "no date" in str(exc)
+    assert catalog.get_dataset("daily").date_columns == ("dt",)
+    assert _q(dataset="daily", ranges={"dt": {"start": "2024-01-02", "end": "2024-01-03"}}).num_rows == 2
 
 
 def test_ranges_on_any_date_column():
@@ -263,7 +262,7 @@ def test_ranges_on_any_date_column():
     # JSON round trip (Flight / POST)
     req = QueryRequest.from_dict({"dataset": "divs", "ranges": {"pay_date": {"start": "2024-05-15"}}})
     assert engine.execute_reader(req).read_all()["amount"].to_pylist() == [4.0]
-    for bad in ({"amount": {"start": "2024-01-01"}},            # not a date column
+    for bad in ({"amount": {"start": "2024-01-01"}},            # not a number
                 {"ex_date": {"start": "2024-05-01", "end": "2024-01-01"}},
                 {"ex_date": {"from": "2024-01-01"}}):            # unknown key
         try:
@@ -283,6 +282,140 @@ def test_ranges_on_any_date_column():
         assert engine.execute_reader(req).read_all().num_rows == 2
     finally:
         catalog.enable_auto_discovery()
+
+
+def test_numeric_and_integer_partition_ranges():
+    _reset("nums2")
+    for y in (2022, 2023, 2024):
+        _write(f"nums2/year={y}/region=eu/p.parquet", pa.table({"px": [10.0, 20.0, 30.0], "qty": [1, 2, 3]}))
+    ds = catalog.get_dataset("nums2")
+    assert ds.sliceable_columns == {"px": "number", "qty": "number", "year": "number"}
+    assert "region" not in ds.sliceable_columns  # string partition: not sliceable
+    out = _q(dataset="nums2", ranges={"year": {"start": 2023}, "px": {"start": 15, "end": 30.0},
+                                      "qty": {"end": "2"}})  # numeric strings accepted
+    assert out.num_rows == 2 and set(out["year"].to_pylist()) == {2023, 2024}
+    for bad in ({"region": {"start": "a"}}, {"px": {"start": 30, "end": 10}}, {"px": {"start": "abc"}}):
+        try:
+            build_sql(QueryRequest(dataset="nums2", ranges=bad))
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+
+
+def test_python_client_slicing():
+    import datetime as dt
+
+    try:
+        from kob.tools.client import KobClient
+    except ModuleNotFoundError:  # the [client] extra (requests) isn't installed
+        print("        (skipped: needs the [client] extra)")
+        return
+    _reset("divs2")
+    _write("divs2/p.parquet", pa.table({"ex_date": [dt.date(2024, m, 1) for m in (1, 2, 3, 4)]}))
+    om = KobClient("http://unused")["divs2"]
+    req = om.request(om.ex_date["2024-02-01":dt.date(2024, 4, 1)], om["pay_date"][:"2024-04-15"],
+                     amount=slice(1.5, None), cp_flag="C", region=["eu", "us"], limit=5)
+    assert req.ranges == {"ex_date": {"start": "2024-02-01", "end": dt.date(2024, 4, 1)},
+                          "pay_date": {"start": None, "end": "2024-04-15"},
+                          "amount": {"start": 1.5, "end": None}}
+    assert [(f.column, f.op, f.value) for f in req.filters] == \
+        [("cp_flag", "=", "C"), ("region", "in", ["eu", "us"])]
+    assert req.to_dict()["ranges"]["ex_date"]["end"] == "2024-04-01"  # JSON-safe on the wire
+    # The slice is inclusive at both ends, end-to-end through the engine:
+    out = engine.execute_reader(om.request(om.ex_date["2024-02-01":"2024-04-01"])).read_all()
+    assert out.num_rows == 3
+    for bad in (lambda: om.ex_date["a":"b":2], lambda: om.ex_date["2024-01-01"],
+                lambda: om.request(om.x[1:2], om.x[3:4])):
+        try:
+            bad()
+            raise AssertionError("expected an error")
+        except (TypeError, ValueError):
+            pass
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_end_to_end_rest_and_flight_servers():
+    # Real servers in-process: `kob --mode rest` (uvicorn) and Arrow Flight, queried with the
+    # KobClient slicing API over both transports — the results must be identical.
+    import datetime as dt
+    import threading
+    import time
+
+    try:
+        import requests
+        import uvicorn
+
+        from kob.tools.client import KobClient
+    except ModuleNotFoundError:
+        print("        (skipped: needs the [client] extra)")
+        return
+    from kob.server.flight import build_server
+    from kob.server.rest import create_rest_app
+
+    _reset("e2e")
+    days = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(60)]
+    for region in ("eu", "us"):
+        _write(f"e2e/region={region}/p.parquet", pa.table({
+            "date": days, "px": [float(i) for i in range(60)], "sym": ["A", "B"] * 30}))
+
+    flight_server, flight_url = build_server("127.0.0.1", _free_port())
+    threading.Thread(target=flight_server.serve, daemon=True).start()
+    rest_port = _free_port()
+    rest = uvicorn.Server(uvicorn.Config(create_rest_app(), host="127.0.0.1", port=rest_port,
+                                         log_level="warning"))
+    threading.Thread(target=rest.run, daemon=True).start()
+    base = f"http://127.0.0.1:{rest_port}"
+    try:
+        for _ in range(100):
+            if rest.started:
+                break
+            time.sleep(0.05)
+        assert rest.started, "REST server did not start"
+
+        results = []
+        for url in (base, flight_url):
+            ds = KobClient(url, compression="zstd")["e2e"]
+            t = ds.query(ds.date["2024-01-10":"2024-01-19"], ds.px[12:15], region=["eu"], sym="A",
+                         columns=["date", "px", "sym", "region"])
+            assert min(t["date"].to_pylist()) >= dt.date(2024, 1, 10)
+            assert max(t["date"].to_pylist()) <= dt.date(2024, 1, 19)  # end is inclusive
+            assert t["px"].to_pylist() == [12.0, 14.0] and set(t["region"].to_pylist()) == {"eu"}
+            results.append(t)
+        assert results[0].equals(results[1]), "REST and Flight returned different data"
+
+        # REST extras: the generated Swagger, the GET form, reload, errors.
+        kob = KobClient(base)
+        spec = requests.get(f"{base}/openapi.json", timeout=10).json()
+        get_params = {p["name"] for p in spec["paths"]["/data/e2e"]["get"]["parameters"]}
+        assert {"date.start", "date.end", "px.min", "px.max", "region", "sym"} <= get_params
+        r = requests.get(f"{base}/data/e2e", params={"date.start": "2024-02-01", "region": "us",
+                                                     "format": "json"}, timeout=10)
+        assert r.status_code == 200 and len(r.json()) == 29
+        assert "Reload datasets" in requests.get(f"{base}/docs", timeout=10).text
+        _write("e2e_new/p.parquet", pa.table({"x": [1]}))
+        assert "e2e_new" in kob.reload()["datasets"]
+        assert "/data/e2e_new" in requests.get(f"{base}/openapi.json", timeout=10).json()["paths"]
+        for bad in (lambda: kob["e2e"].query(kob["e2e"].sym["A":"B"]),  # string: not sliceable
+                    lambda: kob["nope"].query()):
+            try:
+                bad()
+                raise AssertionError("expected an HTTP error")
+            except requests.HTTPError:
+                pass
+        r = requests.get(f"{base}/data/e2e", params={"start": "2024-01-01"}, timeout=10)
+        assert r.status_code == 400  # no implicit date column
+    finally:
+        rest.should_exit = True
+        flight_server.shutdown()
+        catalog.enable_auto_discovery()
+        _reset("e2e_new")
 
 
 # --------------------------------------------------------------------------- #
