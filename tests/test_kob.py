@@ -334,6 +334,143 @@ def test_python_client_slicing():
 
 
 # --------------------------------------------------------------------------- #
+# Inventory: files listed + footers read once; queries planned in memory
+# --------------------------------------------------------------------------- #
+def _segmented(name: str) -> None:
+    """name/year=Y/dt=D/sym=S/part-0.parquet: 2 years x 3 days x 2 symbols = 12 files."""
+    import datetime as dt
+
+    _reset(name)
+    for y in (2023, 2024):
+        for d in (1, 2, 3):
+            day = dt.date(y, 1, d)
+            for s in ("A", "B"):
+                ts = [dt.datetime.combine(day, dt.time(h)) for h in (9, 10)]
+                _write(f"{name}/year={y}/dt={day.isoformat()}/sym={s}/part-0.parquet",
+                       pa.table({"ts": ts, "px": [float(y + d), float(y + d) + 0.5], "qty": [d, d * 10]}))
+
+
+def test_queries_never_list_files_and_prune_in_memory():
+    from kob.core import inventory
+    from kob.core.contract import plan_files
+
+    _segmented("seg")
+    try:
+        catalog.rescan()
+        ds = catalog.get_dataset("seg")
+        inv = ds.inventory
+        assert inv.complete and inv.uniform_schema and len(inv.files) == 12 and inv.total_rows == 24
+        assert ds.sliceable_columns["dt"] == "date" and ds.sliceable_columns["year"] == "number"
+        assert not ds.union_by_name  # uniform schema: DuckDB needn't open every footer
+        assert ds.hive_types == {"year": "BIGINT", "dt": "DATE", "sym": "VARCHAR"}
+
+        def files(**kw):
+            return [f.split("/seg/")[1].rsplit("/", 1)[0] for f in plan_files(QueryRequest("seg", **kw), ds)]
+
+        assert files(filters=[Filter("sym", "=", "A"), Filter("dt", "=", "2024-01-02")]) == \
+            ["year=2024/dt=2024-01-02/sym=A"]
+        assert len(files(filters=[Filter("year", "in", [2023])])) == 6
+        assert len(files(filters=[Filter("year", ">=", 2024), Filter("sym", "!=", "A")])) == 6  # != never prunes
+        assert len(files(ranges={"dt": {"start": "2023-01-02", "end": "2023-01-03"}})) == 4
+        # Footer min/max: no partition filter, yet only the files whose stats can match.
+        assert len(files(ranges={"ts": {"start": "2024-01-03", "end": "2024-01-03"}})) == 2
+        assert len(files(ranges={"qty": {"start": 30}})) == 4                  # max(qty)=30 on day 3
+        assert len(files(filters=[Filter("px", "=", 2026.5)])) == 4             # 2024+2 .. +0.5
+        assert files(filters=[Filter("px", ">", 9999.0)]) == []
+        assert len(files(filters=[Filter("qty", ">=", 29.5)])) == 12  # can't cast to int: keep all
+
+        # The engine agrees with a brute-force filter of a full scan, file pruning or not.
+        full = _q(dataset="seg")
+        for kw in ({"ranges": {"ts": {"start": "2024-01-03", "end": "2024-01-03"}}},
+                   {"filters": [Filter("qty", ">=", 20), Filter("year", "=", 2023)]},
+                   {"filters": [Filter("px", ">", 9999.0)]}):
+            assert _q(dataset="seg", **kw).num_rows == full.filter(_mask(full, kw)).num_rows, kw
+        empty = _q(dataset="seg", filters=[Filter("px", ">", 9999.0)], columns=["ts", "sym"])
+        assert empty.num_rows == 0 and empty.column_names == ["ts", "sym"]
+
+        # facets min/max straight from the footers
+        f = engine.column_facets("seg", ["qty", "ts"])
+        assert f["qty"]["min"] == 1 and f["qty"]["max"] == 30
+
+        # Unknown stats never drop a file.
+        lo, hi = inv.stats["qty"]
+        holes = inventory.Inventory(files=inv.files, partitions=inv.partitions, complete=True,
+                                    stats={"qty": (pa.array([None] * 12, lo.type), hi)})
+        assert len(inventory.prune(holes, [("qty", ">=", 30)])) == 12 - 8  # min null → kept by max
+    finally:
+        catalog.enable_auto_discovery()
+
+
+def _mask(table: pa.Table, kw: dict):
+    import datetime as dt
+
+    import pyarrow.compute as pc
+
+    m = pa.array([True] * table.num_rows)
+    for f in kw.get("filters", []):
+        fn = {">=": pc.greater_equal, ">": pc.greater, "=": pc.equal}[f.op]
+        m = pc.and_(m, fn(table[f.column], f.value))
+    for col, b in kw.get("ranges", {}).items():
+        day = dt.date.fromisoformat(b["start"])
+        lo, hi = dt.datetime.combine(day, dt.time()), dt.datetime.combine(day, dt.time(23, 59, 59))
+        m = pc.and_(m, pc.and_(pc.greater_equal(table[col], lo), pc.less_equal(table[col], hi)))
+    return m
+
+
+def test_inventory_schema_evolution_and_corrupt_files():
+    _reset("evo2")
+    _write("evo2/k=1/a.parquet", pa.table({"x": [1]}))
+    _write("evo2/k=2/b.parquet", pa.table({"x": [2], "extra": [0.5]}))
+    (_TMP / "evo2" / "k=3").mkdir()
+    (_TMP / "evo2" / "k=3" / "broken.parquet").write_bytes(b"PAR1 not really")
+    try:
+        catalog.rescan()
+        ds = catalog.get_dataset("evo2")
+        assert not ds.inventory.uniform_schema and ds.union_by_name  # schemas differ → union
+        assert len(ds.inventory.unreadable) == 1 and len(ds.inventory.files) == 2  # corrupt one excluded
+        assert ds.partition_values["k"] == ["1", "2"]
+        out = _q(dataset="evo2", columns=["x", "extra"])  # query works despite the corrupt file
+        assert sorted(out["x"].to_pylist()) == [1, 2] and None in out["extra"].to_pylist()
+        os.environ["KOB_UNION_BY_NAME"] = "0"
+        assert not ds.union_by_name
+    finally:
+        os.environ.pop("KOB_UNION_BY_NAME", None)
+        catalog.enable_auto_discovery()
+
+
+def test_walk_and_footers_match_and_go_parallel_on_slow_storage():
+    import time as _time
+
+    from kob.core import inventory
+
+    _segmented("seg2")
+    root = str(_TMP / "seg2")
+    ref = sorted((d, sorted(os.path.join(d, f) for f in fs if f.endswith(".parquet")))
+                 for d, _, fs in os.walk(root))
+    assert sorted(inventory.walk(root)) == ref
+
+    calls = {"threads": set()}
+    orig_scandir, orig_tail = inventory._scandir, inventory._tail
+
+    def slow(fn):
+        def wrapped(p):
+            import threading
+            calls["threads"].add(threading.get_ident())
+            _time.sleep(0.002)  # a network round trip
+            return fn(p)
+        return wrapped
+    try:
+        inventory._scandir, inventory._tail = slow(orig_scandir), slow(orig_tail)
+        assert sorted(inventory.walk(root)) == ref
+        files = [f for _, fs in ref for f in fs] * 8  # > 64 probes, so the pool kicks in
+        footers = inventory.read_footers(files)
+        assert all(f.schema is not None for f in footers) and len(footers) == len(files)
+        assert len(calls["threads"]) > 1, "slow storage should have used the thread pool"
+    finally:
+        inventory._scandir, inventory._tail = orig_scandir, orig_tail
+
+
+# --------------------------------------------------------------------------- #
 # kob-open-data builders (offline: inline CSV, no network)
 # --------------------------------------------------------------------------- #
 def test_open_data_builders():
@@ -484,11 +621,33 @@ def test_end_to_end_rest_and_flight_servers():
                 pass
         r = requests.get(f"{base}/data/e2e", params={"start": "2024-01-01"}, timeout=10)
         assert r.status_code == 400  # no implicit date column
+
+        # Flight mode's Swagger app (manual discovery): Reload button + POST /reload, and
+        # Flight sees the new dataset only after the reload.
+        from kob.server.api import create_app
+
+        swag_port = _free_port()
+        swag = uvicorn.Server(uvicorn.Config(create_app(flight_url, manual_discovery=True),
+                                             host="127.0.0.1", port=swag_port, log_level="warning"))
+        threading.Thread(target=swag.run, daemon=True).start()
+        for _ in range(100):
+            if swag.started:
+                break
+            time.sleep(0.05)
+        swag_base = f"http://127.0.0.1:{swag_port}"
+        assert "Reload datasets" in requests.get(f"{swag_base}/docs", timeout=10).text
+        _write("e2e_flight/p.parquet", pa.table({"x": [7]}))
+        assert "e2e_flight" not in [d["name"] for d in requests.get(f"{swag_base}/datasets", timeout=10).json()["datasets"]]
+        assert "e2e_flight" in requests.post(f"{swag_base}/reload", timeout=30).json()["datasets"]
+        fl = KobClient(flight_url)["e2e_flight"]
+        assert fl.query()["x"].to_pylist() == [7]
+        swag.should_exit = True
     finally:
         rest.should_exit = True
         flight_server.shutdown()
         catalog.enable_auto_discovery()
         _reset("e2e_new")
+        _reset("e2e_flight")
 
 
 # --------------------------------------------------------------------------- #

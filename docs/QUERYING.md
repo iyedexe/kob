@@ -166,12 +166,16 @@ use Flight; add `--reload` to rescan the server first.
 
 ## 5. Performance notes
 
+- **No file listing per query.** kob lists files and reads every footer once, on Reload;
+  each query is planned in memory and DuckDB gets an explicit list of only the files that
+  can match (see the README's *Network drives, UNC paths & over-partitioned data*).
 - **Partition filters prune whole folders** before any file is opened — filter on
   `underlying=…` / `year=…` whenever you can (slicing an integer folder like
   `om.year[2022:2023]` prunes too).
-- **Ranges and filters on data columns** use Parquet row-group statistics: blocks outside
-  the range are skipped. Writing files sorted by the columns you range on (e.g.
-  `security_id, date`) makes this much more effective.
+- **Ranges and filters on data columns** prune whole files from their footer min/max
+  (kept since Reload), then Parquet row-group statistics inside the remaining files.
+  Writing files sorted by the columns you range on (e.g. `security_id, date`) makes both
+  much more effective.
 - **Projection** reads only the requested columns — pass `columns=` for wide tables.
 - **Compression:** `none` on a LAN / loopback, `zstd` across a WAN.
 - **Joins** happen client-side: query each dataset, then join the Arrow tables (e.g.

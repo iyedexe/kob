@@ -40,7 +40,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from ..core import catalog, engine
 from ..core.catalog import DATA_ROOT, Dataset
 from ..core.contract import ALLOWED_OPS, Filter, QueryRequest
-from .api import _csv_bytes, _stream_json, dataset_facets
+from .api import RELOAD_WIDGET, _csv_bytes, _stream_json, dataset_facets
 
 ARROW_STREAM_MIME = "application/vnd.apache.arrow.stream"
 
@@ -378,36 +378,6 @@ _STATIC_TAGS = [
 
 
 # --------------------------------------------------------------------------- #
-# Swagger UI with a Reload button
-# --------------------------------------------------------------------------- #
-_RELOAD_WIDGET = """
-<div id="kob-reload-bar" style="position:fixed;top:12px;right:16px;z-index:1000;
-     font-family:sans-serif;font-size:13px;display:flex;gap:8px;align-items:center;">
-  <span id="kob-reload-status" style="color:#3b4151;"></span>
-  <button id="kob-reload-btn" type="button" style="cursor:pointer;padding:6px 14px;border-radius:4px;
-          border:1px solid #49cc90;background:#49cc90;color:#fff;font-weight:600;">
-    &#x21bb; Reload datasets</button>
-</div>
-<script>
-document.getElementById("kob-reload-btn").addEventListener("click", async () => {
-  const btn = document.getElementById("kob-reload-btn");
-  const status = document.getElementById("kob-reload-status");
-  btn.disabled = true; status.textContent = "Rescanning Parquet…";
-  try {
-    const r = await fetch("reload", {method: "POST"});
-    if (!r.ok) throw new Error(r.status + " " + r.statusText);
-    const j = await r.json();
-    status.textContent = j.datasets.length + " dataset(s) in " + j.elapsed_ms + " ms — reloading…";
-    window.location.reload();
-  } catch (e) {
-    status.textContent = "Reload failed: " + e.message; btn.disabled = false;
-  }
-});
-</script>
-"""
-
-
-# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
 def create_rest_app() -> FastAPI:
@@ -442,7 +412,7 @@ def create_rest_app() -> FastAPI:
     @app.get("/docs", include_in_schema=False)
     def docs() -> HTMLResponse:
         page = get_swagger_ui_html(openapi_url="openapi.json", title="kob — REST / Arrow")
-        html = page.body.decode().replace("</body>", _RELOAD_WIDGET + "</body>")
+        html = page.body.decode().replace("</body>", RELOAD_WIDGET + "</body>")
         return HTMLResponse(html)
 
     @app.get("/health", tags=["Catalog"], summary="O(1) liveness")

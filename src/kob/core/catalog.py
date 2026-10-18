@@ -37,7 +37,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+
+from . import inventory
+from .inventory import Inventory
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DATA_ROOT = Path(os.environ.get("KOB_DATA_ROOT", str(REPO_ROOT / "data"))).resolve()
@@ -67,16 +69,28 @@ class Dataset:
     # give an inclusive start/end range. Date/timestamp/numeric data columns, plus partition
     # keys whose folder values are all ISO dates or all integers.
     sliceable_columns: dict[str, str] = field(default_factory=dict)
+    # Every file + partition values (+ footers' min/max when fully scanned): queries are
+    # planned against this in memory and never list the tree (see core/inventory.py).
+    inventory: Inventory | None = None
 
     @property
     def date_columns(self) -> tuple[str, ...]:
         return tuple(c for c, k in self.sliceable_columns.items() if k in ("date", "timestamp"))
 
     @property
-    def glob(self) -> str:
-        # Forward slashes (as_posix) so DuckDB's globber matches on Windows
-        # paths too — backslash separators and UNC "\\" confuse read_parquet.
-        return (self.root / "**" / "*.parquet").as_posix()
+    def union_by_name(self) -> bool:
+        """DuckDB ``union_by_name`` only when files disagree on schema: with it on, DuckDB
+        opens *every* listed footer to reconcile columns before reading a single row."""
+        forced = os.environ.get("KOB_UNION_BY_NAME")
+        if forced in ("0", "1"):
+            return forced == "1"
+        return self.inventory is None or not self.inventory.uniform_schema
+
+    @property
+    def hive_types(self) -> dict[str, str]:
+        """Partition column types, so DuckDB never has to infer them from the paths."""
+        kinds = {"number": "BIGINT", "date": "DATE"}
+        return {k: kinds.get(self.sliceable_columns.get(k, ""), "VARCHAR") for k in self.partition_cols}
 
     def to_public_dict(self, *, with_values: bool = True) -> dict:
         return {
@@ -88,6 +102,13 @@ class Dataset:
             ],
             "data_columns": [{"name": c, "type": t} for c, t in self.data_columns.items()],
             "sliceable_columns": dict(self.sliceable_columns),
+            **({"inventory": {
+                "complete": self.inventory.complete,
+                "uniform_schema": self.inventory.uniform_schema,
+                "rows": self.inventory.total_rows,
+                "columns_with_stats": len(self.inventory.stats),
+                "unreadable_files": list(self.inventory.unreadable),
+            }} if self.inventory is not None else {}),
         }
 
 
@@ -134,54 +155,63 @@ def _sliceable_columns(data_columns: dict[str, str], part_keys: list[str],
 # --------------------------------------------------------------------------- #
 # Discovery
 # --------------------------------------------------------------------------- #
-def _scan_tree(dataset_root: Path) -> tuple[list[str], dict[str, set[str]], list[str], int]:
+def _scan_tree(dataset_root: Path) -> tuple[list[str], dict[str, set[str]], list[tuple[str, dict[str, str]]]]:
+    """One walk of the tree: every Parquet file (posix path) with its partition values."""
     part_values: dict[str, set[str]] = {}
-    samples: list[str] = []
+    files: list[tuple[str, dict[str, str]]] = []
     ordered: list[str] = []
-    file_count = 0
-    for dirpath, _dirnames, filenames in os.walk(dataset_root):
+    for dirpath, pqs in inventory.walk(str(dataset_root)):
         rel = os.path.relpath(dirpath, dataset_root)
         segs = [] if rel == "." else [s for s in rel.split(os.sep) if "=" in s]
-        for seg in segs:
-            k, v = seg.split("=", 1)
+        parts = dict(seg.split("=", 1) for seg in segs)
+        for k, v in parts.items():
             part_values.setdefault(k, set()).add(v)
-        pqs = [f for f in filenames if f.endswith(".parquet")]
-        file_count += len(pqs)
-        if pqs and len(samples) < MAX_SAMPLE_FILES:
-            samples.append(os.path.join(dirpath, pqs[0]))
+        # Forward slashes (as_posix): DuckDB's Hive parsing and Windows UNC paths both want them.
+        files += [(Path(f).as_posix(), parts) for f in pqs]
         # Canonical partition-key order comes from the first *partitioned* file's
         # own path — a stray Parquet at the dataset root must not erase it.
         if pqs and segs and not ordered:
-            ordered = [s.split("=", 1)[0] for s in segs]
-    return ordered, part_values, samples, file_count
+            ordered = list(parts)
+    return ordered, part_values, files
 
 
-def _discover(name: str) -> Dataset | None:
+def _samples(files: list[tuple[str, dict[str, str]]]) -> list[str]:
+    """Up to MAX_SAMPLE_FILES footers to sample, at most one per directory."""
+    seen, out = set(), []
+    for path, _ in files:
+        d = path.rsplit("/", 1)[0]
+        if d not in seen:
+            seen.add(d)
+            out.append(path)
+            if len(out) >= MAX_SAMPLE_FILES:
+                break
+    return out
+
+
+def _discover(name: str, *, full: bool = False) -> Dataset | None:
+    """Discover one dataset. ``full`` reads every footer (in parallel) for the exact schema
+    and per-file statistics — what a Reload does; otherwise a few footers are sampled."""
     root = _safe_dataset_path(name)
     if root is None or not root.is_dir():
         return None
-    part_keys, part_values, samples, file_count = _scan_tree(root)
-    if not samples:
+    part_keys, part_values, files = _scan_tree(root)
+    if not files:
         return None  # a folder with no Parquet is not a dataset
-    # Merge the schemas of the sampled footers (metadata only — no data read):
-    # one corrupt/partial file no longer hides the dataset, and columns added by
-    # schema evolution are discovered if any sampled file carries them.
+    footers = inventory.read_footers([p for p, _ in files] if full else _samples(files), with_stats=full)
+    # Merge the schemas of the read footers (metadata only — no data read): one corrupt or
+    # partial file doesn't hide the dataset, and columns added by schema evolution count.
     data_columns: dict[str, str] = {}
-    for sample in samples:
-        try:
-            # Read via an open file handle rather than handing pyarrow the path
-            # string: pyarrow's own path handling chokes on Windows UNC/network
-            # paths and on non-ASCII characters (accents, etc.), which silently
-            # hides the dataset. Python's open() handles those correctly.
-            with open(sample, "rb") as fh:
-                schema = pq.read_schema(fh)
-        except Exception:
-            continue  # skip an unreadable/corrupt candidate; another may work
-        for f in schema:
-            if f.name not in part_keys:
-                data_columns.setdefault(f.name, _friendly(f.type))
+    for f in footers:
+        for fl in f.schema or ():
+            if fl.name not in part_keys:
+                data_columns.setdefault(fl.name, _friendly(fl.type))
     if not data_columns:
-        return None  # every sampled file was unreadable
+        return None  # every footer read was unreadable
+    inv = inventory.build(files, part_keys, footers, complete=full)
+    if full and len(inv.files) == 0:
+        return None
+    if full:  # partition values from readable files only
+        part_values = {k: set(v for v in inv.partitions[k].to_pylist() if v is not None) for k in part_keys}
     columns = dict(data_columns)
     for k in part_keys:
         columns.setdefault(k, "string")  # Hive keys arrive as strings (DuckDB re-infers)
@@ -194,9 +224,10 @@ def _discover(name: str) -> Dataset | None:
         data_columns=data_columns,
         columns=columns,
         allowed_columns=frozenset(columns),
-        file_count=file_count,
+        file_count=len(inv.files),
         discovered_at=time.monotonic(),
         sliceable_columns=sliceable_columns,
+        inventory=inv,
     )
 
 
@@ -262,7 +293,7 @@ def list_dataset_names(*, refresh: bool = False) -> list[str]:
         return []
     names = []
     for entry in os.scandir(DATA_ROOT):
-        if entry.is_dir():
+        if entry.is_dir() and not entry.name.startswith("."):
             try:
                 get_dataset(entry.name, refresh=refresh)
                 names.append(entry.name)
@@ -289,8 +320,8 @@ def rescan() -> list[Dataset]:
     found: dict[str, Dataset] = {}
     if DATA_ROOT.is_dir():
         for entry in os.scandir(DATA_ROOT):
-            if entry.is_dir():
-                ds = _discover(entry.name)
+            if entry.is_dir() and not entry.name.startswith("."):  # skip .kob-staging-* etc.
+                ds = _discover(entry.name, full=True)
                 if ds is not None:
                     found[entry.name] = ds
     with _lock:

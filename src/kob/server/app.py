@@ -45,6 +45,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--flight-port", type=int, default=8815, help="Arrow Flight (gRPC) data port.")
     p.add_argument("--http-port", type=int, default=8000, help="HTTP/Swagger control-plane port.")
     p.add_argument("--threads", type=int, default=0, help="DuckDB threads (0 = all cores).")
+    p.add_argument("--auto-discovery", action="store_true",
+                   help="flight mode: re-list files on a TTL (KOB_DISCOVERY_TTL) instead of only at "
+                        "startup and on Reload. Costly on network drives; REST mode is always manual.")
     g = p.add_argument_group("open data", "Download real open datasets into the data root "
                                           "(KOB_DATA_ROOT, default ./data) instead of serving.")
     g.add_argument("--get-data", nargs="?", const="core", metavar="SETS",
@@ -88,9 +91,11 @@ def main(argv: list[str] | None = None) -> None:
     # Build the Flight server first: FlightServerBase binds the port on construction, so a
     # port clash fails loudly here (main thread) rather than silently in the worker thread.
     flight_server, flight_location = build_server(args.host, args.flight_port)
+    if not args.auto_discovery:
+        catalog.rescan()  # list files + read footers once; again only on POST /reload
     threading.Thread(target=flight_server.serve, name="kob-flight", daemon=True).start()
 
-    app = create_app(flight_location=flight_location)
+    app = create_app(flight_location=flight_location, manual_discovery=not args.auto_discovery)
     docs_url = f"http://{args.host}:{args.http_port}/docs"
 
     print(
@@ -98,6 +103,9 @@ def main(argv: list[str] | None = None) -> None:
         f"    data  (fast)     Arrow Flight   {flight_location}\n"
         f"    docs  (Swagger)  HTTP           {docs_url}\n"
         f"    data root        {os.environ.get('KOB_DATA_ROOT', './data')}\n"
+        + ("    discovery        auto: re-lists files every KOB_DISCOVERY_TTL seconds\n"
+           if args.auto_discovery else
+           "    discovery        manual: files listed at startup and on Reload (POST /reload) only\n")
     )
     # uvicorn blocks in the foreground; Ctrl-C stops it and the daemon Flight thread exits.
     uvicorn.run(app, host=args.host, port=args.http_port, log_level="info")

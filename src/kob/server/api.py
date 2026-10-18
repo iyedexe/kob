@@ -18,16 +18,18 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from typing import Any
 
 import duckdb
 import pyarrow as pa
 import pyarrow.csv as pacsv
 from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.responses import StreamingResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from ..core import engine
+from ..core import catalog, engine
 from ..core.catalog import DATA_ROOT, get_dataset, list_datasets
 from ..core.contract import QueryRequest
 
@@ -147,15 +149,63 @@ _OPENAPI_TAGS = [
 
 
 # --------------------------------------------------------------------------- #
+# Swagger UI with a Reload button
+# --------------------------------------------------------------------------- #
+RELOAD_WIDGET = """
+<div id="kob-reload-bar" style="position:fixed;top:12px;right:16px;z-index:1000;
+     font-family:sans-serif;font-size:13px;display:flex;gap:8px;align-items:center;">
+  <span id="kob-reload-status" style="color:#3b4151;"></span>
+  <button id="kob-reload-btn" type="button" style="cursor:pointer;padding:6px 14px;border-radius:4px;
+          border:1px solid #49cc90;background:#49cc90;color:#fff;font-weight:600;">
+    &#x21bb; Reload datasets</button>
+</div>
+<script>
+document.getElementById("kob-reload-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("kob-reload-btn");
+  const status = document.getElementById("kob-reload-status");
+  btn.disabled = true; status.textContent = "Rescanning Parquet…";
+  try {
+    const r = await fetch("reload", {method: "POST"});
+    if (!r.ok) throw new Error(r.status + " " + r.statusText);
+    const j = await r.json();
+    status.textContent = j.datasets.length + " dataset(s) in " + j.elapsed_ms + " ms — reloading…";
+    window.location.reload();
+  } catch (e) {
+    status.textContent = "Reload failed: " + e.message; btn.disabled = false;
+  }
+});
+</script>
+"""
+
+
+# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
-def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
+def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION, *, manual_discovery: bool = False) -> FastAPI:
+    """``manual_discovery``: the catalog was scanned up front (``catalog.rescan()``) and is
+    rescanned only by ``POST /reload`` / the Swagger button — queries never list files."""
     app = FastAPI(
         title="kob",
         version="0.4.0",
         description=_API_DESCRIPTION,
         openapi_tags=_OPENAPI_TAGS,
+        **({"docs_url": None} if manual_discovery else {}),
     )
+
+    if manual_discovery:
+        @app.get("/docs", include_in_schema=False)
+        def docs() -> HTMLResponse:
+            page = get_swagger_ui_html(openapi_url="openapi.json", title="kob — Flight + Swagger")
+            return HTMLResponse(page.body.decode().replace("</body>", RELOAD_WIDGET + "</body>"))
+
+        @app.post("/reload", tags=["Discovery"],
+                  summary="Rescan the data root: list files + read footers (the only time kob lists files)")
+        def reload() -> dict:
+            t0 = time.perf_counter()
+            found = catalog.rescan()
+            return {"datasets": [ds.name for ds in found],
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1e3, 1),
+                    "scanned_at": catalog.last_scan_time()}
 
     @app.get("/health", tags=["Discovery"], summary="O(1) liveness")
     def health() -> dict:

@@ -7,8 +7,11 @@ Apache Arrow ``RecordBatch`` objects with no row-by-row conversion. Both servers
 
 Speed notes
 -----------
-* ``enable_object_cache`` keeps Parquet footers/metadata cached across queries, so
-  repeated queries over the same tree skip the metadata read entirely.
+* Queries scan an **explicit file list** planned from the catalog's inventory (see
+  ``core/inventory.py``): DuckDB never lists or globs the tree, and only opens files whose
+  partition values / footer min-max can match.
+* ``parquet_metadata_cache`` keeps Parquet footers cached across queries, so repeated
+  queries over the same files skip the footer read (a network round trip each).
 * ``preserve_insertion_order = false`` lets DuckDB parallelise scans freely.
 * DuckDB worker threads default to all cores; override with ``KOB_DUCKDB_THREADS``.
 """
@@ -42,11 +45,14 @@ def get_connection() -> duckdb.DuckDBPyConnection:
                 conn.execute(f"SET threads TO {int(threads)}")
             # Parallel scans don't need to preserve row order for analytical reads.
             conn.execute("SET preserve_insertion_order = false")
-            # Cache Parquet footers/metadata across queries (big win on repeated queries).
-            try:
-                conn.execute("SET enable_object_cache = true")
-            except duckdb.Error:
-                pass  # setting renamed/removed in some versions — never fatal
+            # Cache Parquet footers across queries (big win on network drives). The
+            # setting's name changed across DuckDB versions; try the current one first.
+            for setting in ("parquet_metadata_cache", "enable_object_cache"):
+                try:
+                    conn.execute(f"SET {setting} = true")
+                    break
+                except duckdb.Error:
+                    continue  # not known to this DuckDB version — never fatal
             # Publish only once fully configured, so a failed SET above can't
             # leave a half-configured connection behind for every later query.
             _conn = conn
@@ -111,32 +117,39 @@ def fetch_schema(req: QueryRequest) -> pa.Schema:
 def column_facets(dataset: str, columns: list[str], *, distinct: bool = False) -> dict[str, dict]:
     """Per-column min/max (and optional approx distinct count) for filter introspection.
 
-    DuckDB resolves min/max from Parquet row-group statistics, so this is cheap even
-    over a large tree. ``approx_count_distinct`` (HLL) is opt-in as it does scan.
+    min/max come straight from the inventory (the footers read at discovery) when every
+    file has statistics — no file is touched. Otherwise DuckDB resolves them from Parquet
+    row-group statistics. ``approx_count_distinct`` (HLL) is opt-in as it does scan.
     """
-    from .catalog import get_dataset  # local import avoids a cycle
-
-    from .contract import _ident  # local import avoids a cycle
+    from . import inventory  # local imports avoid a cycle
+    from .catalog import get_dataset
+    from .contract import _ident, scan_sql
 
     ds = get_dataset(dataset)
     cols = [c for c in columns if c in ds.allowed_columns]
     if not cols:
         return {}
+    out: dict[str, dict] = {}
+    if not distinct and ds.inventory is not None:
+        for c in cols:
+            mm = inventory.column_min_max(ds.inventory, c)
+            if mm is not None:
+                out[c] = {"type": ds.columns[c], "min": mm[0], "max": mm[1]}
+        cols = [c for c in cols if c not in out]
+        if not cols:
+            return out
     selects = []
     for i, c in enumerate(cols):
         q = _ident(c)
         selects.append(f"min({q}) AS mn{i}, max({q}) AS mx{i}")
         if distinct:
             selects.append(f"approx_count_distinct({q}) AS nd{i}")
-    glob = ds.glob.replace("'", "''")
-    sql = (f"SELECT {', '.join(selects)} "
-           f"FROM read_parquet('{glob}', hive_partitioning = true, union_by_name = true)")
+    sql = f"SELECT {', '.join(selects)} FROM {scan_sql(ds)}"
     cur = cursor()
     try:
-        row = cur.execute(sql).fetchone()
+        row = cur.execute(sql, [ds.inventory.files.to_pylist()]).fetchone()
     finally:
         cur.close()
-    out: dict[str, dict] = {}
     idx = 0
     for c in cols:
         entry = {"type": ds.columns[c], "min": row[idx], "max": row[idx + 1]}

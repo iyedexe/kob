@@ -27,8 +27,8 @@ Bounds are inclusive; either side may be omitted. Dates are ISO dates or datetim
 date-only `end` on a timestamp column covers that whole day. (The Python client spells this
 as slices: ``ds.ex_date["2024-01-01":"2024-03-31"]``.)
 
-`build_sql` turns that into a parameterised DuckDB statement against the dataset's
-Hive-partitioned Parquet glob. Column/op names are validated against the *discovered*
+`build_sql` turns that into a parameterised DuckDB statement over an explicit list of the
+dataset's Parquet files — pruned in memory from the catalog's inventory, never globbed. Column/op names are validated against the *discovered*
 schema and all *values* are bound parameters, so untrusted clients cannot inject SQL.
 """
 
@@ -38,6 +38,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import inventory
 from .catalog import Dataset, get_dataset
 
 # Operators clients may use. Mapped to their SQL spelling.
@@ -217,28 +218,48 @@ def _validate(req: QueryRequest) -> Dataset:
     return ds
 
 
+def scan_sql(ds: Dataset) -> str:
+    """``read_parquet(?, …)`` over an explicit file list (bound as the first parameter).
+
+    No glob: DuckDB never lists the tree. Partition types come from discovery
+    (``hive_types``), and ``union_by_name`` is on only when files disagree on schema."""
+    opts = ["hive_partitioning = true", f"union_by_name = {'true' if ds.union_by_name else 'false'}"]
+    if ds.hive_types:
+        types = ", ".join(f"'{k.replace(chr(39), chr(39) * 2)}': '{t}'" for k, t in ds.hive_types.items())
+        opts.append("hive_types = {" + types + "}")
+    return f"read_parquet(?, {', '.join(opts)})"
+
+
+def plan_files(req: QueryRequest, ds: Dataset) -> list[str]:
+    """The files that may hold matching rows — decided in memory from the inventory."""
+    preds = [(f.column, f.op, f.value) for f in req.filters]
+    preds += _date_ranges(req, ds)
+    return inventory.prune(ds.inventory, preds, ds.sliceable_columns)
+
+
 def build_sql(req: QueryRequest) -> tuple[str, list[Any]]:
     """Return ``(sql, params)`` for a parameterised DuckDB query.
 
-    The Parquet glob comes from the trusted catalog and is inlined as a literal;
-    every client-supplied *value* is a bound ``?`` parameter.
+    The first parameter is the explicit list of files to scan (planned from the catalog's
+    inventory — see :func:`plan_files`); every client-supplied *value* is a bound ``?``.
     """
     ds = _validate(req)
+    files = plan_files(req, ds)
 
     if req.columns:
         projection = ", ".join(_ident(c) for c in req.columns)
     else:
         projection = "*"
 
-    # Glob is server-controlled (from discovery), so inlining is safe. Escape quotes defensively.
-    glob_literal = ds.glob.replace("'", "''")
-    sql = (
-        f"SELECT {projection} "
-        f"FROM read_parquet('{glob_literal}', hive_partitioning = true, union_by_name = true)"
-    )
-
-    params: list[Any] = []
     clauses: list[str] = []
+    if not files:
+        # Nothing can match: read one footer per distinct schema, just for the result schema.
+        schema_files = ds.inventory.schema_files
+        files = list(schema_files if ds.union_by_name else schema_files[:1])
+        clauses.append("FALSE")
+    params: list[Any] = [files]
+    sql = f"SELECT {projection} FROM {scan_sql(ds)}"
+
     for f in req.filters:
         col = _ident(f.column)
         op = f.op.lower()
