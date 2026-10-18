@@ -10,6 +10,9 @@ wheels/
 # Data: NEVER committed — kob discovers whatever you drop locally.
 # Regenerate samples with: uv run --extra gen kob-gen --scale small
 data/
+data-*/
+# kob --get-data stages partial downloads next to the data root
+.kob-staging-*/
 
 # .NET (C# client)
 clients/csharp/bin/

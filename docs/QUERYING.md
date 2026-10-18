@@ -13,7 +13,10 @@ equivalent; pick whichever fits the caller.
 
 The examples use the sample data from `uv run --extra gen kob-gen --scale small`:
 `optionmetrics` (partitioned by `underlying`, `year`; date columns `date`, `expiry`) and
-`georev` (partitioned by `year`; date column `period_end`).
+`georev` (partitioned by `year`; date column `period_end`). For **real** data — daily S&P 500
+prices, FX, index membership, VIX, plus heavy UK house sales, crypto candles and FX ticks —
+run `uv run kob --get-data` (or `--get-data all`) and see
+[`OPEN_DATA.md`](OPEN_DATA.md) for schemas and ready-made queries.
 
 ---
 

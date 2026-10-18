@@ -14,12 +14,14 @@ control plane never touches it.
     kob                                   # Flight :8815 + Swagger http://127.0.0.1:8000/docs
     kob --host 0.0.0.0 --flight-port 8815 --http-port 8000 --threads 0
     kob --mode rest --port 9000           # REST only: Arrow over HTTP + per-dataset Swagger
+    kob --get-data [core|heavy|all|list|name,…]   # download open datasets into the data root
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import threading
 
 import uvicorn
@@ -43,7 +45,36 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--flight-port", type=int, default=8815, help="Arrow Flight (gRPC) data port.")
     p.add_argument("--http-port", type=int, default=8000, help="HTTP/Swagger control-plane port.")
     p.add_argument("--threads", type=int, default=0, help="DuckDB threads (0 = all cores).")
+    g = p.add_argument_group("open data", "Download real open datasets into the data root "
+                                          "(KOB_DATA_ROOT, default ./data) instead of serving.")
+    g.add_argument("--get-data", nargs="?", const="core", metavar="SETS",
+                   help="Comma-separated datasets or groups: core (default), heavy, all — or "
+                        "'list' to show what's available.")
+    g.add_argument("--from", dest="date_from", metavar="YYYY-MM",
+                   help="Heavy sets: first month/year to fetch (inclusive).")
+    g.add_argument("--to", dest="date_to", metavar="YYYY-MM",
+                   help="Heavy sets: last month/year to fetch (inclusive).")
+    g.add_argument("--symbols", help="crypto_klines_1m: comma-separated Binance symbols, "
+                                     "e.g. BTCUSDT,ETHUSDT (default: 10 majors).")
     args = p.parse_args(argv)
+
+    if args.get_data:
+        from ..tools import open_data
+
+        if args.get_data == "list":
+            print(open_data.describe())
+            return
+        for flag in (args.date_from, args.date_to):
+            if flag and not re.fullmatch(r"\d{4}(-\d{2})?", flag):
+                p.error(f"--from/--to must be YYYY or YYYY-MM, got {flag!r}")
+        try:
+            open_data.resolve(args.get_data)
+        except ValueError as exc:
+            p.error(str(exc))
+        open_data.get_data(args.get_data, catalog.DATA_ROOT, open_data.Options(
+            start=args.date_from, end=args.date_to,
+            symbols=[s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None))
+        return
 
     if args.threads:
         os.environ["KOB_DUCKDB_THREADS"] = str(args.threads)

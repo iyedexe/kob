@@ -216,7 +216,8 @@ src/kob/
     arrow_http/   Arrow IPC over plain HTTP
     json/         REST/JSON (the slow, ubiquitous baseline)
     protobuf/     gRPC + Protocol Buffers (row + columnar)
-  tools/     optional utilities (each needs its install extra)
+  tools/     optional utilities (most need an install extra)
+    open_data.py       real open datasets → Parquet (`kob --get-data`, no extra)
     generate_data.py   synthetic sample datasets (kob-gen)
     client.py          reference Python client + CLI (kob-client)
     benchmark.py       Flight-vs-HTTP-vs-Protobuf-vs-JSON shoot-out (kob-bench)
@@ -230,14 +231,89 @@ uv sync                                       # or: pip install -e .  (Python �
 KOB_DATA_ROOT=/path/to/parquet uv run kob     # Flight :8815 + Swagger :8000/docs
 ```
 
-No data yet? Generate realistic samples and serve them:
+No data yet? Grab **real, open financial data** into the data root and serve it:
 
 ```bash
-uv sync --extra gen && uv run kob-gen --scale small && uv run kob
+uv run kob --get-data                  # core sets: ~25 MB, ~5 s        (or: make get-data)
+uv run kob --get-data all              # + ~60M rows of heavy data     (or: make get-data-heavy)
+uv run kob --mode rest                 # → http://localhost:8000/docs
 ```
 
 Open **http://localhost:8000/docs** — Swagger UI with a working **Try it out** for every
-endpoint, plus a `/flight` page describing how to pull data over Flight.
+endpoint. (Synthetic samples are still available: `uv sync --extra gen && uv run kob-gen`.)
+
+## Open datasets — `kob --get-data`
+
+> Full guide — every schema, source, licence, option and measured query:
+> [`docs/OPEN_DATA.md`](docs/OPEN_DATA.md).
+
+`kob --get-data [SETS]` downloads real, public data and writes it as Hive-partitioned
+Parquet, sorted for range pruning, into the data root kob serves (`KOB_DATA_ROOT`, default
+`./data`) — then exits. Sources and licences land in `<root>/SOURCES.md`. No extra
+dependencies.
+
+```bash
+uv run kob --get-data list                                   # every set, with sizes
+uv run kob --get-data                                        # = core (default)
+uv run kob --get-data heavy                                  # the three heavy sets, default ranges
+uv run kob --get-data crypto_klines_1m --symbols BTCUSDT,ETHUSDT --from 2021-01 --to 2024-12
+uv run kob --get-data forex_ticks --from 2015-01 --to 2015-06   # ~6 x 70M ticks
+uv run kob --get-data uk_house_prices --from 2015                # years 2015..2023
+KOB_DATA_ROOT=/big/disk uv run kob --get-data all
+```
+
+Heavy sets are **resumable** — months/years already on disk are skipped — and each piece is
+written to a staging folder outside the data root and moved in when complete, so a running
+`kob` never sees a half-written partition (press **Reload** in REST mode to pick them up).
+
+### Core sets (public CSVs on GitHub, ~5 s)
+
+| dataset | rows | span | columns | partitions | source (licence) |
+|---|---:|---|---|---|---|
+| `prices_daily` | 619k | 2013-02 → 2018-02 | date, ticker, open, high, low, close, volume | `year` | Kaggle S&P 500 stock data, 505 tickers (CC0) |
+| `fx_daily` | 263k | 1971 → today | date, currency, country, units_per_usd, usd_per_unit | `year` | Fed H.10 via FRED / datahub.io (PDDL) |
+| `index_membership` | 1.6M | 1996 → 2025-08 | date, ticker | `index`, `year` | S&P 500 member list on each day membership changed — members on day D = latest snapshot ≤ D (Wikipedia-derived) |
+| `index_membership_periods` | 1.3k | 1996 → today | index, ticker, start_date, end_date (null = still in) | — | fja05680/sp500 |
+| `sp500_constituents` | 503 | today | ticker, name, sector, sub_industry, headquarters, date_added, cik, founded | — | datahub.io, from Wikipedia |
+| `sp500_monthly` | 1.9k | 1871 → today | date, sp500, dividend, earnings, cpi, long_interest_rate, real_*, pe10 | — | Robert Shiller via datahub.io (PDDL) |
+| `vix_daily` | 9.3k | 1990 → today | date, open, high, low, close | — | CBOE via datahub.io |
+| `brent_daily` | 9.1k | 1987 → today | date, price | — | US EIA via datahub.io (PDDL) |
+
+### Heavy sets (public S3 buckets, streamed)
+
+| dataset | rows (default range) | span | columns | partitions | source (licence) |
+|---|---:|---|---|---|---|
+| `uk_house_prices` | 28.1M (all years, ~1 min) | 1995 → 2023-02 | date, price, postcode, type, is_new, duration, addr1, addr2, street, locality, town, district, county | `year` | HM Land Registry Price Paid (Open Government Licence v3.0 — attribution required) |
+| `crypto_klines_1m` | ~5M (10 symbols x 12 months) | 2017 → last month | open_time, close_time (UTC), open, high, low, close, volume, quote_volume, trades, taker_buy_* | `symbol`, `year` | Binance public market data (see Binance's terms) |
+| `forex_ticks` | 70–145M per month (default 2022-08: 144.5M, ~30 s) | 2000-05 → 2022-08 | datetime (UTC), bid, ask, base, quote | `pair`, `year` | histdata.com ticks, hosted by ClickHouse (check histdata's terms) |
+
+Choose ranges with `--from` / `--to` (`YYYY` or `YYYY-MM`) and `--symbols`. The whole forex
+archive is ~11.5 billion ticks / ~550 GB, so pick months deliberately.
+
+```python
+from kob.tools.client import KobClient
+import duckdb
+
+kob = KobClient("http://127.0.0.1:8000")
+px, fx, mem = kob["prices_daily"], kob["fx_daily"], kob["index_membership"]
+
+px.query(px.date["2017-01-01":"2017-03-31"], ticker=["AAPL", "MSFT"])   # Q1 2017 closes
+px.query(px.volume[100_000_000:], columns=["date", "ticker", "volume"])  # 100M+ share days
+fx.query(fx.date["2024-01-01":"2024-12-31"], currency=["EUR", "GBP"])    # FX for 2024
+kob["vix_daily"].query(kob["vix_daily"].close[50:])                      # VIX panics
+
+# The S&P 500 basket on 2017-06-30, priced in EUR: three queries + a client-side join.
+day = "2017-06-30"
+asof = max(mem.query(mem.date[:day], columns=["date"])["date"].to_pylist())   # snapshot <= day
+members = mem.query(mem.date[asof:asof], columns=["ticker"])["ticker"].to_pylist()
+closes = px.query(px.date[day:day], ticker=members, columns=["ticker", "close"])
+eur = fx.query(fx.date[day:day], currency="EUR", columns=["usd_per_unit"])
+duckdb.sql("SELECT c.ticker, c.close / e.usd_per_unit AS close_eur FROM closes c, eur e").df()
+```
+
+FX note: `units_per_usd` is units of the currency per 1 USD (EUR 0.92), `usd_per_unit` its
+inverse (1 EUR = 1.09 USD). `index_membership_periods.end_date` is null for current
+members.
 
 ## Query
 
