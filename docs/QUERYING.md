@@ -16,7 +16,7 @@ The examples use the sample data from `uv run --extra gen kob-gen --scale small`
 `georev` (partitioned by `year`; date column `period_end`). For **real** data — daily S&P 500
 prices, FX, index membership, VIX, plus heavy UK house sales, crypto candles and FX ticks —
 run `uv run kob --get-data` (or `--get-data all`) and see
-[Open datasets](../README.md#open-datasets) for ready-made queries.
+[`OPEN_DATA.md`](OPEN_DATA.md) for schemas and ready-made queries.
 
 ---
 

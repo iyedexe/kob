@@ -244,6 +244,9 @@ endpoint. (Synthetic samples are still available: `uv sync --extra gen && uv run
 
 ## Open datasets — `kob --get-data`
 
+> Full guide — every schema, source, licence, option and measured query:
+> [`docs/OPEN_DATA.md`](docs/OPEN_DATA.md).
+
 `kob --get-data [SETS]` downloads real, public data and writes it as Hive-partitioned
 Parquet, sorted for range pruning, into the data root kob serves (`KOB_DATA_ROOT`, default
 `./data`) — then exits. Sources and licences land in `<root>/SOURCES.md`. No extra

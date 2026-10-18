@@ -19,6 +19,7 @@ kob serves (``KOB_DATA_ROOT``, default ``./data``), so ``kob --mode rest`` works
     crypto_klines_1m/symbol=BTCUSDT/year=2024/   Binance 1-minute candles (pick symbols/months)
     forex_ticks/pair=EURUSD/year=2015/   histdata.com bid/ask ticks, 70-145M rows per month
 
+Full guide (schemas, sources, licences, examples): ``docs/OPEN_DATA.md``.
 Sources and licences are written to ``<root>/SOURCES.md``. Heavy sets are resumable: months
 / years already on disk are skipped, and each one is staged outside the data root and moved
 into place only when complete, so a running server never sees a half-written partition.
