@@ -216,7 +216,8 @@ src/kob/
     arrow_http/   Arrow IPC over plain HTTP
     json/         REST/JSON (the slow, ubiquitous baseline)
     protobuf/     gRPC + Protocol Buffers (row + columnar)
-  tools/     optional utilities (each needs its install extra)
+  tools/     optional utilities (most need an install extra)
+    open_data.py       real open financial datasets → Parquet (kob-open-data, no extra)
     generate_data.py   synthetic sample datasets (kob-gen)
     client.py          reference Python client + CLI (kob-client)
     benchmark.py       Flight-vs-HTTP-vs-Protobuf-vs-JSON shoot-out (kob-bench)
@@ -230,14 +231,58 @@ uv sync                                       # or: pip install -e .  (Python �
 KOB_DATA_ROOT=/path/to/parquet uv run kob     # Flight :8815 + Swagger :8000/docs
 ```
 
-No data yet? Generate realistic samples and serve them:
+No data yet? Grab **real, open financial data** (about 4 s, ~23 MB of Parquet, no extra
+dependencies) and serve it:
 
 ```bash
-uv sync --extra gen && uv run kob-gen --scale small && uv run kob
+uv run kob-open-data                                     # → ./data-open   (or: make open-data)
+KOB_DATA_ROOT=data-open uv run kob --mode rest           # → http://localhost:8000/docs
 ```
 
 Open **http://localhost:8000/docs** — Swagger UI with a working **Try it out** for every
-endpoint, plus a `/flight` page describing how to pull data over Flight.
+endpoint. (Synthetic samples are still available: `uv sync --extra gen && uv run kob-gen`.)
+
+## Open datasets
+
+`kob-open-data` downloads public CSVs (all hosted on GitHub) and writes them as
+Hive-partitioned Parquet, sorted for range pruning. Sources and licences land in
+`data-open/SOURCES.md`.
+
+| dataset | rows | span | columns | partitions | source (licence) |
+|---|---:|---|---|---|---|
+| `prices_daily` | 619k | 2013-02 → 2018-02 | date, ticker, open, high, low, close, volume | `year` | Kaggle S&P 500 stock data, 505 tickers (CC0) |
+| `fx_daily` | 263k | 1971 → today | date, currency, country, units_per_usd, usd_per_unit | `year` | Fed H.10 via FRED / datahub.io (PDDL) |
+| `index_membership` | 1.6M | 1996 → 2025-08 | date, ticker | `index`, `year` | S&P 500 member list on each day membership changed — members on day D = latest snapshot ≤ D (Wikipedia-derived) |
+| `index_membership_periods` | 1.3k | 1996 → today | index, ticker, start_date, end_date (null = still in) | — | fja05680/sp500 |
+| `sp500_constituents` | 503 | today | ticker, name, sector, sub_industry, headquarters, date_added, cik, founded | — | datahub.io, from Wikipedia |
+| `sp500_monthly` | 1.9k | 1871 → today | date, sp500, dividend, earnings, cpi, long_interest_rate, real_*, pe10 | — | Robert Shiller via datahub.io (PDDL) |
+| `vix_daily` | 9.3k | 1990 → today | date, open, high, low, close | — | CBOE via datahub.io |
+| `brent_daily` | 9.1k | 1987 → today | date, price | — | US EIA via datahub.io (PDDL) |
+
+```python
+from kob.tools.client import KobClient
+import duckdb
+
+kob = KobClient("http://127.0.0.1:8000")
+px, fx, mem = kob["prices_daily"], kob["fx_daily"], kob["index_membership"]
+
+px.query(px.date["2017-01-01":"2017-03-31"], ticker=["AAPL", "MSFT"])   # Q1 2017 closes
+px.query(px.volume[100_000_000:], columns=["date", "ticker", "volume"])  # 100M+ share days
+fx.query(fx.date["2024-01-01":"2024-12-31"], currency=["EUR", "GBP"])    # FX for 2024
+kob["vix_daily"].query(kob["vix_daily"].close[50:])                      # VIX panics
+
+# The S&P 500 basket on 2017-06-30, priced in EUR: three queries + a client-side join.
+day = "2017-06-30"
+asof = max(mem.query(mem.date[:day], columns=["date"])["date"].to_pylist())   # snapshot <= day
+members = mem.query(mem.date[asof:asof], columns=["ticker"])["ticker"].to_pylist()
+closes = px.query(px.date[day:day], ticker=members, columns=["ticker", "close"])
+eur = fx.query(fx.date[day:day], currency="EUR", columns=["usd_per_unit"])
+duckdb.sql("SELECT c.ticker, c.close / e.usd_per_unit AS close_eur FROM closes c, eur e").df()
+```
+
+FX note: `units_per_usd` is units of the currency per 1 USD (EUR 0.92), `usd_per_unit` its
+inverse (1 EUR = 1.09 USD). `index_membership_periods.end_date` is null for current
+members.
 
 ## Query
 

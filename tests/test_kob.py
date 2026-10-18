@@ -333,6 +333,40 @@ def test_python_client_slicing():
             pass
 
 
+# --------------------------------------------------------------------------- #
+# kob-open-data builders (offline: inline CSV, no network)
+# --------------------------------------------------------------------------- #
+def test_open_data_builders():
+    import datetime as dt
+
+    import pyarrow.compute as pc
+
+    from kob.tools import open_data as od
+
+    fx, parts = od.build_fx_daily(b"Date,Country,Exchange rate\n"
+                                  b"2024-06-03,Euro,0.9183\n2024-06-03,Japan,156.04\n"
+                                  b"2024-06-04,Euro,\n")  # blank rate dropped
+    assert parts == ["year"] and fx.num_rows == 2
+    eur = fx.filter(pc.equal(fx["currency"], "EUR")).to_pylist()[0]
+    assert eur["units_per_usd"] == 0.9183 and abs(eur["usd_per_unit"] - 1.0890) < 1e-3  # 1 EUR ≈ 1.09 USD
+    assert eur["date"] == dt.date(2024, 6, 3) and eur["year"] == 2024
+
+    mem, parts = od.build_index_membership(b'date,tickers\n2020-01-02,"AAPL,MSFT"\n'
+                                           b'2020-01-02,"AAPL,MSFT"\n2020-01-03,"AAPL, GOOG"\n')
+    assert parts == ["index", "year"]
+    assert [(r["date"].day, r["ticker"]) for r in mem.to_pylist()] == \
+        [(2, "AAPL"), (2, "MSFT"), (3, "AAPL"), (3, "GOOG")]  # deduped, trimmed, sorted
+
+    per, _ = od.build_index_membership_periods(b"ticker,start_date,end_date\nA,2000-06-05,\n"
+                                               b"AABA,1999-12-08,2017-06-19\n")
+    assert per["end_date"].to_pylist() == [None, dt.date(2017, 6, 19)]  # still a member → null
+
+    px, _ = od.build_prices_daily(b"date,open,high,low,close,volume,Name\n"
+                                  b"2013-02-08,15.07,15.12,14.63,14.75,8407500,AAL\n")
+    assert px.column_names == ["date", "ticker", "open", "high", "low", "close", "volume", "year"]
+    assert od.SOURCES.keys() == od.BUILDERS.keys()
+
+
 def _free_port() -> int:
     import socket
 

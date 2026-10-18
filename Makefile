@@ -1,5 +1,5 @@
 # Convenience targets. Requires: uv, (optional) dotnet, cmake + apache-arrow for C++.
-.PHONY: help setup test data data-small data-medium data-large serve rest flight \
+.PHONY: help setup test data data-small data-medium data-large open-data serve-open serve rest flight \
         demo-arrow demo-json demo-proto notebook bench \
         client csharp-build csharp-run cpp-build cpp-run clean clean-data
 
@@ -21,6 +21,10 @@ data-medium:     ## Generate the medium sample dataset (needs [gen])
 data-large:      ## Generate the large sample dataset (needs [gen])
 	uv run --extra gen kob-gen --scale large
 data: data-small ## Alias for data-small
+open-data:       ## Download real open financial datasets (prices, FX, S&P membership, VIX, …) to data-open/
+	uv run kob-open-data --out data-open
+serve-open:      ## Serve data-open/ in REST mode (http://localhost:8000/docs)
+	KOB_DATA_ROOT=data-open uv run kob --mode rest --port 8000
 
 serve:           ## Run kob: Arrow Flight (:8815) + Swagger UI (http://localhost:8000/docs)
 	uv run kob
@@ -57,4 +61,4 @@ cpp-run:         ## Run the C++ client over Flight (server must be up)
 clean:           ## Remove build artifacts
 	rm -rf clients/cpp/build clients/csharp/bin clients/csharp/obj
 clean-data:      ## Remove generated data
-	rm -rf data/georev data/optionmetrics data/MANIFEST.json
+	rm -rf data/georev data/optionmetrics data/MANIFEST.json data-open
