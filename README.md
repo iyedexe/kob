@@ -17,6 +17,14 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob
 #   docs  (Swagger)  HTTP            http://127.0.0.1:8000/docs
 ```
 
+No gRPC where you are? Run it as one plain-HTTP server that still serves Arrow, with a
+Swagger UI generated from your datasets ([REST mode](#rest-mode--kob---mode-rest)):
+
+```bash
+KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 8000
+#   data + docs      HTTP           http://127.0.0.1:8000/docs
+```
+
 ---
 
 ## Why kob exists
@@ -95,11 +103,14 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
 ```
 
 - **Swagger generated from your data.** Every discovered dataset gets its own section with
-  typed endpoints: `GET /data/{dataset}` has `start` / `end` for a date range (and
-  `<col>.start` / `<col>.end` on every date column), plus one query parameter per column — partition keys
-  and string columns are multi-select pickers (`IN`), numeric/date columns get `col` (exact)
-  and `col.min` / `col.max` (range), `columns` is an enum of the dataset's columns — and
-  `POST /data/{dataset}` takes the usual JSON contract with column names as enums.
+  typed endpoints. `GET /data/{dataset}` has one query parameter per column:
+  - partition keys and string columns → multi-select pickers (`IN`), filled with real values;
+  - date/timestamp columns → `col.start` / `col.end` (inclusive range), plus `start` / `end`
+    as a shorthand for the dataset's main date column;
+  - numeric columns → `col` (exact, integers) and `col.min` / `col.max` (range);
+  - `columns` (projection, an enum of the dataset's columns), `filter` (`col:op:value`), `limit`.
+
+  `POST /data/{dataset}` takes the usual JSON contract, with column names as enums.
 - **Arrow over REST.** Responses are an Arrow IPC stream (`application/vnd.apache.arrow.stream`,
   `?compression=none|zstd|lz4`). `?format=json|csv` is there for eyeballing results in Swagger.
 - **Manual discovery.** The tree is scanned **once at startup** and then only when you press
@@ -121,6 +132,32 @@ tbl = query_rest(base, QueryRequest(dataset="dividends", ranges={
           "ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
           "pay_date": {"end": "2024-06-30"}}))
 ```
+
+## Arrow Flight vs Arrow over REST
+
+Both carry **the same bytes** — Arrow IPC record batches, nothing to decode row by row. What
+differs is the envelope around them:
+
+| | Flight (`kob`, gRPC `:8815`) | Arrow over REST (`kob --mode rest`) |
+|---|---|---|
+| Protocol | gRPC on HTTP/2 | plain HTTP — one request, Arrow IPC body |
+| Client needs | a Flight library (pyarrow, Arrow C++/C#/Java/Go/Rust) | any HTTP client + an Arrow IPC reader (`curl`, `requests`, browsers/JS) |
+| Round trips | 2 (`GetFlightInfo` → `DoGet`); schema known before any data | 1; schema at the head of the body |
+| Scale-out | multiple endpoints per query, parallel streams, HTTP/2 multiplexing | one stream per request |
+| Errors | gRPC status, also mid-stream | HTTP status up front; a mid-stream error truncates the stream |
+| Infrastructure | needs gRPC-aware proxies/LBs end to end | works through anything that speaks HTTP: gateways, WAFs, CDNs, Swagger |
+| Discovery | `/docs` control plane on `:8000` | per-dataset Swagger generated from the data, with **Reload** |
+| Discovery refresh | automatic (TTL cache) | manual (startup + Reload / `POST /reload`) |
+
+Measured on one localhost stream they are neck and neck (1.75M rows: Flight 67 ms vs
+HTTP-Arrow 72 ms) — both 150–1750× faster than JSON ([report](docs/PERFORMANCE_REPORT.md)).
+Flight pulls ahead under concurrency and with parallel endpoints; REST wins on reach. Use
+`compression=none` on a LAN and `zstd` across a WAN. The query contract is identical, so a
+client switches with one call: `query_flight(...)` ↔ `query_rest(...)`.
+
+**Pick Flight** for service-to-service bulk pulls on a network you control. **Pick REST**
+when gRPC is blocked or awkward — corporate proxies, API gateways, browsers, Excel/Power
+Query, `curl` scripts — or when people should explore the data through Swagger.
 
 ## Project layout
 
@@ -267,8 +304,9 @@ the best Protobuf** ([full report](docs/PERFORMANCE_REPORT.md)).
 ## Clients
 
 Working clients for **Python, C#, C++ and Excel** — see [`clients/`](clients/README.md).
-All speak the JSON contract above. Flight (`:8815`) is the recommended transport; Excel and
-other HTTP-only consumers use the Swagger server's JSON/CSV `/query` (`:8000`).
+All speak the JSON contract above. Flight (`:8815`) is the recommended transport; HTTP-only
+consumers can use `kob --mode rest` (Arrow over HTTP, `query_rest` in the Python client) or,
+for Excel, the Swagger server's JSON/CSV `/query` (`:8000`).
 
 ## Why Arrow + Flight?
 
