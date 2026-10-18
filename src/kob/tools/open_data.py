@@ -15,7 +15,7 @@ kob serves (``KOB_DATA_ROOT``, default ``./data``), so ``kob --mode rest`` works
 
 **heavy** — public S3 buckets, streamed and re-partitioned::
 
-    uk_house_prices/year=2020/           HM Land Registry Price Paid: ~30M sales, 1995-2023
+    uk_house_prices/year=2020/           HM Land Registry Price Paid: 28M sales, 1995 -> 2023-02
     crypto_klines_1m/symbol=BTCUSDT/year=2024/   Binance 1-minute candles (pick symbols/months)
     forex_ticks/pair=EURUSD/year=2015/   histdata.com bid/ask ticks, 70-145M rows per month
 
