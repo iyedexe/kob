@@ -8,8 +8,9 @@ discovers your datasets, tells every client exactly which columns and partitions
 **fastest** transport — Arrow **Flight** (gRPC) — right next to a **Swagger UI** for
 discovery and interactive exploration.
 
-No database to stand up. No schema to declare. No restart when new data lands. Four
-dependencies.
+No database to stand up. No schema to declare. No restart when new data lands — press
+**Reload**. Four dependencies. Fast on network drives, UNC shares and over-partitioned
+trees: files are listed once per Reload, never per query.
 
 ```bash
 KOB_DATA_ROOT=/path/to/parquet uv run kob
@@ -53,28 +54,32 @@ three **core** modules feed every transport:
    events/dt=…/region=…/*.parquet         │  catalog   discover datasets/partitions/cols  │
    prices/symbol=…/year=…/*.parquet       │  contract  validate query → parameterised SQL │
          │                                │  engine    DuckDB → Apache Arrow (pushdown)   │
-         ▼  folder walk + one file's      └───────────────────────┬───────────────────────┘
-            metadata (no data scan)                               │  one Arrow RecordBatch stream
-            self-discovery, cached TTL          ┌─────────────────┴─────────────────┐
+         ▼  folder walk + every footer    └───────────────────────┬───────────────────────┘
+            (no data scan) — only at                              │  files planned in memory →
+            startup and on Reload                                 │  one Arrow RecordBatch stream
+                                                ┌─────────────────┴─────────────────┐
                                                 ▼                                   ▼
                                        Arrow Flight (gRPC)                    Swagger / HTTP
                                        the fast DATA path  ⚡                 discovery + try-it-out
                                        grpc://…:8815                          http://…:8000/docs
 ```
 
-1. **Discover** — `core/catalog` walks `KOB_DATA_ROOT`. Datasets are top-level folders of
-   Parquet; partition columns + values come from the `key=value` folder names (filesystem
-   only); data columns + types come from one Parquet file's metadata. No data is scanned,
-   and the result is cached with a short TTL so freshly-dropped files appear automatically.
+1. **Discover** — `core/catalog` walks `KOB_DATA_ROOT` **once, at startup and on Reload**
+   (the Swagger button / `POST /reload`). Datasets are top-level folders of Parquet;
+   partition columns + values come from the `key=value` folder names; every file's footer
+   is read (in parallel on slow storage) for the exact schema, row counts and per-file
+   min/max. No data is scanned. This **inventory** is all a query needs — see
+   [Network drives & over-partitioned data](#network-drives-unc-paths--over-partitioned-data).
 2. **Describe the filter surface** — clients learn what they can filter on *per folder*
    (partition values) and *per column* (min/max/distinct via `facets`), so they build valid
    queries without guessing.
 3. **Validate & build SQL** — `core/contract` turns one small JSON query object into a
    parameterised DuckDB statement. Column/operator names are checked against the discovered
    schema; every value is a bound parameter (no SQL injection).
-4. **Execute** — `core/engine` runs it on DuckDB, which pushes partition + projection +
-   predicate pruning *into* the Parquet scan and streams the result out as Arrow with no
-   row-by-row conversion.
+4. **Execute** — `core/engine` runs it on DuckDB over an **explicit list of only the files
+   that can match** (pruned in memory from the inventory: partition values + footer
+   min/max — no listing, no glob). DuckDB pushes projection + predicate pruning into the
+   scan and streams the result out as Arrow with no row-by-row conversion.
 5. **Serve** — the `kob` command (`server/app`) starts **two** things that share that one
    engine: **Arrow Flight** for the fast data path, and a **Swagger HTTP** control plane for
    discovery and interactive exploration. The data path stays pure Flight; the HTTP side
@@ -187,7 +192,7 @@ differs is the envelope around them:
 | Errors | gRPC status, also mid-stream | HTTP status up front; a mid-stream error truncates the stream |
 | Infrastructure | needs gRPC-aware proxies/LBs end to end | works through anything that speaks HTTP: gateways, WAFs, CDNs, Swagger |
 | Discovery | `/docs` control plane on `:8000` | per-dataset Swagger generated from the data, with **Reload** |
-| Discovery refresh | automatic (TTL cache) | manual (startup + Reload / `POST /reload`) |
+| Discovery refresh | manual (startup + Reload / `POST /reload`); `--auto-discovery` for a TTL | manual (startup + Reload / `POST /reload`) |
 
 Measured on one localhost stream they are neck and neck (1.75M rows: Flight 67 ms vs
 HTTP-Arrow 72 ms) — both 150–1750× faster than JSON ([report](docs/PERFORMANCE_REPORT.md)).
@@ -204,7 +209,8 @@ Query, `curl` scripts — or when people should explore the data through Swagger
 ```
 src/kob/
   core/      the product — no web/RPC code
-    catalog.py    filesystem auto-discovery (datasets, partitions, columns)
+    catalog.py    filesystem auto-discovery (datasets, partitions, columns), manual Reload
+    inventory.py  per-file inventory (files, partitions, footer min/max) + in-memory pruning
     contract.py   the JSON query contract + parameterised SQL builder
     engine.py     DuckDB execution → streaming Apache Arrow
   server/    the `kob` entry point (Flight + Swagger, started together; or --mode rest)
@@ -376,9 +382,11 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 | `GET /datasets/{name}/facets?columns=a,b[&distinct=true]` | per-column **min/max** (+ approx-distinct) — the per-column filter options |
 | `GET /flight` | the Flight connection URI + how to pull results over it |
 | `POST /query` | run a query interactively → JSON (default) or CSV |
+| `POST /reload` | rescan the data root (also the **Reload datasets** button on `/docs`) |
 
-Swagger UI at `/docs`, ReDoc at `/redoc`, raw schema at `/openapi.json`.
-Append `?refresh=true` to `/datasets` or `/datasets/{name}` to bypass the discovery cache.
+Swagger UI at `/docs` (with a **Reload datasets** button), ReDoc at `/redoc`, raw schema at
+`/openapi.json`. With `--auto-discovery`, `?refresh=true` on `/datasets` or
+`/datasets/{name}` bypasses the TTL cache instead.
 
 ## Tests
 
@@ -395,13 +403,53 @@ identical Arrow tables over both. Without the `[client]` extra the end-to-end te
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `KOB_DATA_ROOT` | `./data` | Folder the producer drops Parquet into |
-| `KOB_DISCOVERY_TTL` | `15` | Seconds to cache discovery before re-scanning |
+| `KOB_DATA_ROOT` | `./data` | Folder the producer drops Parquet into (local, mounted share or UNC path) |
+| `KOB_SCAN_THREADS` | `32` | Parallel directory listings / footer reads during a Reload — used only when storage proves slow (network); local disks stay serial |
+| `KOB_UNION_BY_NAME` | auto | `1`/`0` forces DuckDB `union_by_name`; auto = on only when files' schemas differ |
 | `KOB_DUCKDB_THREADS` | all cores | DuckDB threads |
+| `KOB_DISCOVERY_TTL` | `15` | `--auto-discovery` only: seconds between re-listings |
+| `KOB_MAX_SAMPLE_FILES` | `4` | `--auto-discovery` only: footers sampled per dataset |
 
-CLI: `kob --host 0.0.0.0 --flight-port 8815 --http-port 8000 --threads 0`
-or `kob --mode rest --host 0.0.0.0 --port 8000` (`KOB_DISCOVERY_TTL` doesn't apply in REST
-mode — discovery there is manual).
+CLI: `kob --host 0.0.0.0 --flight-port 8815 --http-port 8000 --threads 0 [--auto-discovery]`
+or `kob --mode rest --host 0.0.0.0 --port 8000` (REST mode is always manual).
+
+## Network drives, UNC paths & over-partitioned data
+
+On a network drive, a UNC share (`\\server\share\…`) or an object-store mount, every
+directory listing, `stat` and footer read is a round trip, and an over-partitioned Hive
+tree (`year=/dt=/symbol=/…`) has tens of thousands of them. kob therefore does all file
+system discovery **once, on Reload**, and nothing per query:
+
+| | when | what |
+|---|---|---|
+| **Reload** (startup, Swagger button, `POST /reload`) | rarely | list every directory and read every footer → in-memory **inventory**: files, partition values, exact schema (uniform or not), row counts, per-file **min/max** for every column with statistics. Listings and footer reads switch to a thread pool (`KOB_SCAN_THREADS`) as soon as storage proves slow. |
+| **Query** | always | **prune files in memory** — partition values (`=`, `in`, `<`…`>=`, ranges) *and* footer min/max (a range on `ts`, `qty >= 99`, `px = …`) — then hand DuckDB that **explicit file list** with known `hive_types`. No listing, no glob, no `stat` of other files; footers are opened only for files that can match, and DuckDB caches them (`parquet_metadata_cache`). `union_by_name` stays off unless schemas really differ, so DuckDB doesn't open every footer to reconcile columns. |
+| `facets` min/max | always | answered from the inventory — no file is opened |
+
+Pruning is conservative: unknown statistics, uncastable values and operators like `!=`,
+`like`, `not in` never drop a file, and DuckDB still applies every filter itself. Unreadable
+(corrupt / half-written) files are skipped at Reload and listed under `inventory` in
+`GET /datasets/{name}` instead of failing queries. Explicit paths are passed with forward
+slashes and footers are read through Python's `open()`, so UNC and non-ASCII paths work.
+
+Measured on a 10,000-file tree (`year=/dt=/sym=`, 11,005 directories), per query
+(file-system calls counted with `strace`; times on local SSD with a warm page cache — the
+gap is far larger on a network):
+
+| query | before: dir listings / opens / stats | after | before → after (local SSD) |
+|---|---|---|---:|
+| one symbol, one day | 44,112 / 10,002 / 63,036 | **0 / 2 / 1** | 548 → **1.9 ms** |
+| `year=2024`, 2 symbols | 44,016 / 11,464 / 63,009 | **0** / 1,464 / 732 | 644 → **36 ms** |
+| one week on data column `ts` (no partition filter) | 44,016 / 30,000 / 63,009 | **0 / 140 / 70** | 881 → **5.8 ms** |
+| `qty >= 99` (most files can match) | 44,016 / 30,000 / 63,009 | **0** / 12,870 / 6,435 | 820 → **285 ms** |
+
+The cost moved to Reload: 0.9 s for the 10,000 footers on local disk; on a simulated
+2 ms-per-call share the parallel listing + footer reads take ~5 s instead of ~45 s serially.
+
+Still slow? The biggest remaining lever is the **number of files**: thousands of tiny
+files cost a footer read each. Compact small partitions into fewer, larger files (aim for
+tens to hundreds of MB), sort them by the columns you range on (so min/max prune well),
+and avoid partition keys with very many values.
 
 ## Demos & benchmark
 
