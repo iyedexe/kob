@@ -27,6 +27,7 @@ CLI::
     kob-client --transport rest --dataset events --columns user_id,amount --limit 10
     kob-client --transport rest --reload --dataset events      # rescan first, then query
     kob-client --transport rest --dataset prices --start 2024-01-01 --end 2024-03-31
+    kob-client --dataset dividends --range ex_date=2024-01-01..2024-03-31 --range pay_date=..2024-06-30
     kob-client --transport http --dataset events --columns user_id,amount --limit 10
 """
 
@@ -103,12 +104,15 @@ def query_rest_params(base_url: str, dataset: str, *, compression: str = "zstd",
     Keyword args map to query parameters: ``region=["eu", "us"]`` (IN),
     ``amount__min=100`` / ``amount__max=500`` (→ ``amount.min`` / ``amount.max``),
     ``columns=["a", "b"]``, ``filter=["strike:>:100"]``, ``start="2024-01-01"``,
-    ``end="2024-03-31"``, ``limit=10``.
+    ``end="2024-03-31"``, ``ex_date__start="2024-01-01"`` / ``ex_date__end=...`` (a range on
+    any date column → ``ex_date.start`` / ``ex_date.end``), ``limit=10``.
     """
     query: list[tuple[str, object]] = [("format", "arrow"), ("compression", compression)]
     for k, v in params.items():
-        if k.endswith("__min") or k.endswith("__max"):
-            k = f"{k[:-5]}.{k[-3:]}"
+        for suffix in ("__min", "__max", "__start", "__end"):
+            if k.endswith(suffix):
+                k = f"{k[:-len(suffix)]}.{suffix[2:]}"
+                break
         if k == "columns" and isinstance(v, (list, tuple)):
             v = ",".join(map(str, v))
         for item in v if isinstance(v, (list, tuple)) else [v]:
@@ -149,8 +153,16 @@ def _req_from_args(args: argparse.Namespace) -> QueryRequest:
         col, op, val = raw.split(":", 2)
         filters.append(Filter(col, op, _coerce(val)))
     columns = [c.strip() for c in args.columns.split(",")] if args.columns else None
+    ranges: dict[str, dict[str, str | None]] = {}
+    for raw in args.range or []:
+        col, _, span = raw.partition("=")
+        start, sep, end = span.partition("..")
+        if not col or not sep:
+            raise SystemExit(f"--range must be 'column=start..end' (either side optional), got {raw!r}")
+        ranges[col] = {"start": start or None, "end": end or None}
     return QueryRequest(dataset=args.dataset, columns=columns, filters=filters, limit=args.limit,
-                        start=args.start, end=args.end, date_column=args.date_column)
+                        start=args.start, end=args.end, date_column=args.date_column,
+                        ranges=ranges)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -168,6 +180,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--start", help="Inclusive start date (ISO) on the dataset's date column.")
     p.add_argument("--end", help="Inclusive end date (ISO) on the dataset's date column.")
     p.add_argument("--date-column", help="Column for --start/--end (default: auto-detected).")
+    p.add_argument("--range", action="append",
+                   help="Date range on any date column, 'column=start..end' (repeatable; either "
+                        "side optional), e.g. 'ex_date=2024-01-01..2024-03-31' or 'pay_date=..2024-06-30'.")
     p.add_argument("--compression", default="zstd", choices=["zstd", "lz4", "none"])
     p.add_argument("--head", type=int, default=5, help="Rows to preview.")
     p.add_argument("--reload", action="store_true",

@@ -245,6 +245,46 @@ def test_iso_date_partition_is_a_date_column():
         assert "no date" in str(exc)
 
 
+def test_ranges_on_any_date_column():
+    import datetime as dt
+
+    from kob.server.rest import create_rest_app, request_from_query_params
+
+    _reset("divs")
+    ex = [dt.date(2024, m, 1) for m in (1, 2, 3, 4)]
+    pay = [dt.date(2024, m, 15) for m in (2, 3, 4, 5)]
+    _write("divs/p.parquet", pa.table({"ex_date": ex, "pay_date": pay, "amount": [1.0, 2.0, 3.0, 4.0]}))
+    ds = catalog.get_dataset("divs")
+    assert set(ds.date_columns) == {"ex_date", "pay_date"}
+    # Two date columns at once, AND-ed; open-ended sides allowed.
+    out = _q(dataset="divs", ranges={"ex_date": {"start": "2024-02-01", "end": "2024-04-01"},
+                                     "pay_date": {"end": "2024-04-15"}})
+    assert out["amount"].to_pylist() == [2.0, 3.0]
+    # JSON round trip (Flight / POST)
+    req = QueryRequest.from_dict({"dataset": "divs", "ranges": {"pay_date": {"start": "2024-05-15"}}})
+    assert engine.execute_reader(req).read_all()["amount"].to_pylist() == [4.0]
+    for bad in ({"amount": {"start": "2024-01-01"}},            # not a date column
+                {"ex_date": {"start": "2024-05-01", "end": "2024-01-01"}},
+                {"ex_date": {"from": "2024-01-01"}}):            # unknown key
+        try:
+            build_sql(QueryRequest.from_dict({"dataset": "divs", "ranges": bad}))
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    # REST: <col>.start / <col>.end in the generated spec and the GET parser
+    try:
+        app = create_rest_app()
+        names = {p["name"] for p in app.openapi()["paths"]["/data/divs"]["get"]["parameters"]}
+        assert {"ex_date.start", "ex_date.end", "pay_date.start", "pay_date.end"} <= names
+        assert "ex_date.min" not in names
+        req = request_from_query_params(catalog.get_dataset("divs"),
+                                        [("ex_date.start", "2024-03-01"), ("pay_date.end", "")])
+        assert req.ranges == {"ex_date": {"start": "2024-03-01", "end": None}}
+        assert engine.execute_reader(req).read_all().num_rows == 2
+    finally:
+        catalog.enable_auto_discovery()
+
+
 # --------------------------------------------------------------------------- #
 # REST mode (manual discovery, per-dataset OpenAPI, Arrow IPC)
 # --------------------------------------------------------------------------- #

@@ -111,6 +111,11 @@ class QueryModel(BaseModel):
     date_column: str | None = Field(
         None, description="Column for start/end; defaults to the dataset's detected date column "
                           "(see `date_column` in GET /datasets/{name}).")
+    ranges: dict[str, dict[str, str | None]] = Field(
+        default_factory=dict,
+        description="Inclusive start/end on any date column (see `date_columns` in "
+                    "GET /datasets/{name}), AND-ed; either side optional.",
+        examples=[{"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}}])
 
     model_config = {
         "json_schema_extra": {

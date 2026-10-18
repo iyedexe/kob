@@ -36,6 +36,8 @@ uv run kob-client --transport http --port 8001 --dataset georev --filter 'year:=
 uv run kob-client --transport rest --reload --dataset georev --filter 'year:=:2023' --limit 5
 # Date range on the dataset's date column (any transport):
 uv run kob-client --dataset optionmetrics --start 2023-03-01 --end 2023-03-31 --limit 5
+# Ranges on any date column(s), either side optional:
+uv run kob-client --dataset optionmetrics --range date=2023-03-01..2023-03-31 --range expiry=..2023-04-30 --limit 5
 ```
 
 Importable API: `from kob.tools.client import query_flight, query_http, query_rest,

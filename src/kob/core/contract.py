@@ -16,8 +16,14 @@
     }
 
 `start` / `end` filter the dataset's date column (auto-detected at discovery, e.g. ``date``
-or ``trade_date``; override with ``"date_column"``). Both are inclusive ISO dates or
-datetimes; a date-only `end` on a timestamp column covers that whole day.
+or ``trade_date``; override with ``"date_column"``). ``ranges`` gives a start/end to *any*
+date/timestamp column, several at once (AND-ed)::
+
+    "ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
+               "pay_date": {"end": "2024-06-30"}}
+
+Bounds are inclusive ISO dates or datetimes; either side may be omitted; a date-only `end`
+on a timestamp column covers that whole day.
 
 `build_sql` turns that into a parameterised DuckDB statement against the dataset's
 Hive-partitioned Parquet glob. Column/op names are validated against the *discovered*
@@ -56,6 +62,8 @@ class QueryRequest:
     start: str | None = None        # inclusive ISO date/datetime on the date column
     end: str | None = None          # inclusive ISO date/datetime on the date column
     date_column: str | None = None  # defaults to the dataset's detected date column
+    # Any date column -> {"start": iso, "end": iso} (either key optional), AND-ed.
+    ranges: dict[str, dict[str, str | None]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "QueryRequest":
@@ -75,6 +83,7 @@ class QueryRequest:
             start=_iso_or_none(d.get("start")),
             end=_iso_or_none(d.get("end")),
             date_column=d.get("date_column") or None,
+            ranges=_ranges_from(d.get("ranges")),
         )
 
     def to_dict(self) -> dict:
@@ -86,7 +95,21 @@ class QueryRequest:
             "start": self.start,
             "end": self.end,
             "date_column": self.date_column,
+            "ranges": self.ranges,
         }
+
+
+def _ranges_from(raw: Any) -> dict[str, dict[str, str | None]]:
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError('ranges must be an object: {"<date column>": {"start": ..., "end": ...}}')
+    out: dict[str, dict[str, str | None]] = {}
+    for col, bounds in raw.items():
+        if not isinstance(bounds, dict) or not set(bounds) <= {"start", "end"}:
+            raise ValueError(f'ranges[{col!r}] must be {{"start": ..., "end": ...}}, got {bounds!r}')
+        out[col] = {"start": _iso_or_none(bounds.get("start")), "end": _iso_or_none(bounds.get("end"))}
+    return out
 
 
 def _iso_or_none(v: Any) -> str | None:
@@ -106,18 +129,14 @@ def _parse_iso(name: str, raw: str) -> dt.date | dt.datetime:
         raise ValueError(f"{name} must be an ISO date or datetime (e.g. 2026-06-01), got {raw!r}") from None
 
 
-def _date_range(req: QueryRequest, ds: Dataset) -> list[tuple[str, Any]]:
-    """Validate start/end and return ``(sql_op, value)`` bounds for the date column."""
-    if req.start is None and req.end is None:
-        return []
-    col = req.date_column or ds.date_column
-    if col is None:
-        raise ValueError(f"Dataset '{ds.name}' has no date/timestamp column; start/end need one "
-                         "(pass date_column to pick a column explicitly)")
-    if col not in ds.allowed_columns:
-        raise ValueError(f"Unknown date_column for '{ds.name}': {col!r}")
-    start = _parse_iso("start", req.start) if req.start is not None else None
-    end = _parse_iso("end", req.end) if req.end is not None else None
+def _range_bounds(ds: Dataset, col: str, start_raw: str | None,
+                  end_raw: str | None) -> list[tuple[str, Any]]:
+    """Validate one inclusive start/end on a date column → ``(sql_op, value)`` bounds."""
+    if col not in ds.date_columns:
+        raise ValueError(f"{col!r} is not a date column of '{ds.name}' "
+                         f"(date columns: {list(ds.date_columns)})")
+    start = _parse_iso(f"{col} start", start_raw) if start_raw is not None else None
+    end = _parse_iso(f"{col} end", end_raw) if end_raw is not None else None
     bounds: list[tuple[str, Any]] = []
     if start is not None:
         bounds.append((">=", start))
@@ -130,8 +149,21 @@ def _date_range(req: QueryRequest, ds: Dataset) -> list[tuple[str, Any]]:
     if start is not None and end is not None:
         as_dt = lambda v: v if isinstance(v, dt.datetime) else dt.datetime.combine(v, dt.time())  # noqa: E731
         if as_dt(start) > as_dt(end):
-            raise ValueError(f"start ({req.start}) is after end ({req.end})")
+            raise ValueError(f"{col}: start ({start_raw}) is after end ({end_raw})")
     return bounds
+
+
+def _date_ranges(req: QueryRequest, ds: Dataset) -> list[tuple[str, str, Any]]:
+    """All date-range bounds of a request as ``(column, sql_op, value)``."""
+    out: list[tuple[str, str, Any]] = []
+    if req.start is not None or req.end is not None:
+        col = req.date_column or ds.date_column
+        if col is None:
+            raise ValueError(f"Dataset '{ds.name}' has no date/timestamp column; start/end need one")
+        out += [(col, op, v) for op, v in _range_bounds(ds, col, req.start, req.end)]
+    for col, b in req.ranges.items():
+        out += [(col, op, v) for op, v in _range_bounds(ds, col, b.get("start"), b.get("end"))]
+    return out
 
 
 def _ident(name: str) -> str:
@@ -163,8 +195,9 @@ def _validate(req: QueryRequest) -> Dataset:
                 f"Operator {f.op!r} on {f.column!r} requires a list of values, "
                 f'e.g. {{"column": "{f.column}", "op": "{f.op}", "value": ["a", "b"]}}'
             )
-    if req.date_column is not None and req.date_column not in ds.allowed_columns:
-        raise ValueError(f"Unknown date_column for '{ds.name}': {req.date_column!r}")
+    if req.date_column is not None and req.date_column not in ds.date_columns:
+        raise ValueError(f"date_column must be one of {list(ds.date_columns)} for '{ds.name}', "
+                         f"got {req.date_column!r}")
     if req.limit is not None and not (0 < req.limit <= MAX_LIMIT):
         raise ValueError(f"limit must be in (0, {MAX_LIMIT}]")
     return ds
@@ -208,9 +241,8 @@ def build_sql(req: QueryRequest) -> tuple[str, list[Any]]:
             clauses.append(f"{col} {op.upper()} ?")
             params.append(f.value)
 
-    date_col = req.date_column or ds.date_column
-    for op, value in _date_range(req, ds):
-        clauses.append(f"{_ident(date_col)} {op} ?")
+    for col, op, value in _date_ranges(req, ds):
+        clauses.append(f"{_ident(col)} {op} ?")
         params.append(value)
 
     if clauses:

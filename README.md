@@ -95,8 +95,8 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
 ```
 
 - **Swagger generated from your data.** Every discovered dataset gets its own section with
-  typed endpoints: `GET /data/{dataset}` has `start` / `end` for a date range, plus one
-  query parameter per column — partition keys
+  typed endpoints: `GET /data/{dataset}` has `start` / `end` for a date range (and
+  `<col>.start` / `<col>.end` on every date column), plus one query parameter per column — partition keys
   and string columns are multi-select pickers (`IN`), numeric/date columns get `col` (exact)
   and `col.min` / `col.max` (range), `columns` is an enum of the dataset's columns — and
   `POST /data/{dataset}` takes the usual JSON contract with column names as enums.
@@ -117,6 +117,9 @@ tbl = query_rest(base, QueryRequest(dataset="optionmetrics",
                                     filters=[Filter("underlying", "in", ["AAPL", "MSFT"])]))
 tbl = query_rest_params(base, "optionmetrics", underlying=["AAPL"],
                         start="2023-03-01", end="2023-03-31", strike__min=100)
+tbl = query_rest(base, QueryRequest(dataset="dividends", ranges={
+          "ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
+          "pay_date": {"end": "2024-06-30"}}))
 ```
 
 ## Project layout
@@ -201,6 +204,11 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
   `as_of_date`, … or the first date/timestamp column; a `dt=2024-01-01` folder also counts),
   shown as `date_column` in `GET /datasets/{name}`. Pass `"date_column": "ex_date"` to use
   another one. A date-only `end` on a timestamp column covers that whole day.
+- **Ranges on any date column:** every date/timestamp column (listed as `date_columns`) can
+  take its own start/end, several at once (AND-ed), either side optional:
+  `"ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}, "pay_date": {"end": "2024-06-30"}}`.
+  In REST mode the GET form has `ex_date.start` / `ex_date.end` for each date column; the CLI
+  takes `--range ex_date=2024-01-01..2024-03-31`.
 - **Filters** may target data columns **or** partition keys — partition filters prune whole
   folders before any file is read.
 - For large or latency-sensitive pulls, use **Flight**; the HTTP `/query` is for

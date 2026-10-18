@@ -147,6 +147,15 @@ def request_from_query_params(ds: Dataset, items: list[tuple[str, str]]) -> Quer
     end = next((v for v in reversed(grouped.pop("end", [])) if v), None)
     date_column = next((v for v in reversed(grouped.pop("date_column", [])) if v), None)
 
+    ranges: dict[str, dict[str, str | None]] = {}
+    for key in [k for k in grouped if k.endswith((".start", ".end"))]:
+        col, _, side = key.rpartition(".")
+        if col not in ds.date_columns:
+            continue  # not a date column: falls through to "unknown parameter" below
+        val = next((v for v in reversed(grouped.pop(key)) if v), None)
+        if val is not None:
+            ranges.setdefault(col, {"start": None, "end": None})[side] = val
+
     filters: list[Filter] = []
     for raw in grouped.pop("filter", []):
         try:
@@ -179,7 +188,7 @@ def request_from_query_params(ds: Dataset, items: list[tuple[str, str]]) -> Quer
             filters.append(Filter(col, op, _coerce(ds, col, vals[-1])))
 
     return QueryRequest(dataset=ds.name, columns=columns, filters=filters, limit=limit,
-                        start=start, end=end, date_column=date_column)
+                        start=start, end=end, date_column=date_column, ranges=ranges)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +248,19 @@ def _date_params(ds: Dataset) -> list[dict]:
     ]
 
 
+def _range_params(ds: Dataset, col: str) -> list[dict]:
+    t = ds.columns.get(col, "date")
+    whole_day = " A date-only end covers that whole day." if t == "timestamp" else ""
+    return [
+        {"name": f"{col}.start", "in": "query", "required": False,
+         "description": f"`{col}` from this date, inclusive ({t}).",
+         "schema": {"type": "string", "format": "date"}},
+        {"name": f"{col}.end", "in": "query", "required": False,
+         "description": f"`{col}` up to this date, inclusive ({t}).{whole_day}",
+         "schema": {"type": "string", "format": "date"}},
+    ]
+
+
 def _get_operation(ds: Dataset) -> dict:
     col_names = list(ds.columns)
     params: list[dict] = [
@@ -256,6 +278,8 @@ def _get_operation(ds: Dataset) -> dict:
             "schema": {"type": "array", "items": {"type": "string",
                                                   "enum": ds.partition_values.get(k, [])}},
         })
+        if k in ds.date_columns:
+            params += _range_params(ds, k)
     for c, t in ds.data_columns.items():
         if c in _RESERVED:
             continue
@@ -268,7 +292,9 @@ def _get_operation(ds: Dataset) -> dict:
             params.append({"name": c, "in": "query", "required": False, "explode": True,
                            "description": f"`{c}` IN values ({t}); repeat or comma-separate.",
                            "schema": {"type": "array", "items": js}})
-        if t in _RANGE_TYPES:
+        if c in ds.date_columns:
+            params += _range_params(ds, c)
+        elif t in _RANGE_TYPES:
             params.append({"name": f"{c}.min", "in": "query", "required": False,
                            "description": f"`{c}` >= value ({t}).", "schema": js})
             params.append({"name": f"{c}.max", "in": "query", "required": False,
@@ -287,7 +313,9 @@ def _get_operation(ds: Dataset) -> dict:
         "summary": f"Query {ds.name} (typed parameters)",
         "description": (f"All filters are AND-ed. {ds.file_count} Parquet file(s); partitioned by "
                         f"{', '.join(f'`{k}`' for k in ds.partition_cols) or 'nothing'}."
-                        + (f" Date range: `start` / `end` on `{ds.date_column}`." if ds.date_column else "")),
+                        + (f" Date ranges: `start` / `end` apply to `{ds.date_column}`; every date "
+                           "column also has its own `<column>.start` / `<column>.end`."
+                           if ds.date_column else "")),
         "operationId": f"get_data_{ds.name}",
         "parameters": params,
         "responses": _responses(ds),
@@ -321,6 +349,14 @@ def _post_operation(ds: Dataset) -> dict:
                         "description": f"Inclusive end on `{ds.date_column}` (or `date_column`)."},
                 "date_column": {"type": "string", "enum": list(ds.date_columns),
                                 "default": ds.date_column},
+                "ranges": {
+                    "type": "object",
+                    "description": "Inclusive start/end per date column (AND-ed); either side optional.",
+                    "properties": {c: {"type": "object", "properties": {
+                        "start": {"type": "string", "format": "date"},
+                        "end": {"type": "string", "format": "date"}}} for c in ds.date_columns},
+                    "additionalProperties": False,
+                },
             } if ds.date_columns else {}),
         },
         "example": {"columns": example_cols, "filters": example_filters, "limit": 1000},
