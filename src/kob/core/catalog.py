@@ -17,6 +17,11 @@ Discovery is cached with a short TTL so freshly-dropped files/partitions appear 
 a restart, while steady-state lookups are a single dict hit (all derived lookups are
 precomputed at discovery time).
 
+**Manual mode** (used by ``kob --mode rest``): :func:`rescan` takes one snapshot of the
+whole tree and from then on lookups are served from it only — no TTL, no tree walks on
+the request path. The tree is re-walked only when :func:`rescan` is called again (the
+Swagger "Reload" button). :func:`enable_auto_discovery` switches back to TTL mode.
+
 Security: a dataset name is always a single path segment that must resolve *inside*
 the data root, and only names found by discovery are accepted — there is no way to
 escape the root via ``..`` or absolute paths.
@@ -25,6 +30,7 @@ escape the root via ``..`` or absolute paths.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -57,6 +63,10 @@ class Dataset:
     allowed_columns: frozenset[str]          # precomputed: hot path for filter validation
     file_count: int
     discovered_at: float
+    # Columns usable for a start/end date range (date/timestamp data columns, plus partition
+    # keys whose folder values are ISO dates), and the default one picked for `start`/`end`.
+    date_columns: tuple[str, ...] = ()
+    date_column: str | None = None
 
     @property
     def glob(self) -> str:
@@ -73,6 +83,8 @@ class Dataset:
                 for k in self.partition_cols
             ],
             "data_columns": [{"name": c, "type": t} for c, t in self.data_columns.items()],
+            "date_column": self.date_column,
+            "date_columns": list(self.date_columns),
         }
 
 
@@ -93,6 +105,27 @@ def _friendly(t: pa.DataType) -> str:
     if pa.types.is_string(t) or pa.types.is_large_string(t):
         return "string"
     return str(t)
+
+
+# --------------------------------------------------------------------------- #
+# Date column detection (for start/end range queries)
+# --------------------------------------------------------------------------- #
+# Preferred names for the default date column, most specific first; otherwise the first
+# date/timestamp column in schema order wins.
+_DATE_NAME_PREFERENCE = ("date", "as_of_date", "asof_date", "trade_date", "value_date",
+                         "price_date", "effective_date", "dt", "timestamp", "ts")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _date_columns(data_columns: dict[str, str], part_keys: list[str],
+                  part_values: dict[str, set[str]]) -> tuple[tuple[str, ...], str | None]:
+    cols = [c for c, t in data_columns.items() if t in ("date", "timestamp")]
+    cols += [k for k in part_keys
+             if part_values.get(k) and all(_ISO_DATE.match(v) for v in part_values[k])]
+    by_lower = {c.lower(): c for c in cols}
+    default = next((by_lower[n] for n in _DATE_NAME_PREFERENCE if n in by_lower),
+                   cols[0] if cols else None)
+    return tuple(cols), default
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +182,7 @@ def _discover(name: str) -> Dataset | None:
     columns = dict(data_columns)
     for k in part_keys:
         columns.setdefault(k, "string")  # Hive keys arrive as strings (DuckDB re-infers)
+    date_columns, date_column = _date_columns(data_columns, part_keys, part_values)
     return Dataset(
         name=name,
         root=root,
@@ -159,6 +193,8 @@ def _discover(name: str) -> Dataset | None:
         allowed_columns=frozenset(columns),
         file_count=file_count,
         discovered_at=time.monotonic(),
+        date_columns=date_columns,
+        date_column=date_column,
     )
 
 
@@ -181,6 +217,10 @@ def _safe_dataset_path(name: str) -> Path | None:
 # --------------------------------------------------------------------------- #
 _lock = threading.Lock()
 _cache: dict[str, Dataset] = {}
+# When not None, discovery is manual: lookups are served from this snapshot only and
+# the filesystem is walked again only by rescan().
+_snapshot: dict[str, Dataset] | None = None
+_snapshot_at: float | None = None  # wall-clock time of the last rescan()
 
 
 def _fresh(ds: Dataset) -> bool:
@@ -188,6 +228,13 @@ def _fresh(ds: Dataset) -> bool:
 
 
 def get_dataset(name: str, *, refresh: bool = False) -> Dataset:
+    snap = _snapshot
+    if snap is not None:  # manual mode: never touch the filesystem (refresh is ignored)
+        try:
+            return snap[name]
+        except KeyError:
+            raise KeyError(f"Unknown dataset '{name}' (not in the last scan of {DATA_ROOT}; "
+                           "reload to rescan)") from None
     with _lock:
         cached = _cache.get(name)
         if cached is not None and not refresh and _fresh(cached):
@@ -206,6 +253,9 @@ def get_dataset(name: str, *, refresh: bool = False) -> Dataset:
 
 def list_dataset_names(*, refresh: bool = False) -> list[str]:
     """Top-level folders under the data root that contain at least one Parquet file."""
+    snap = _snapshot
+    if snap is not None:
+        return sorted(snap)
     if not DATA_ROOT.is_dir():
         return []
     names = []
@@ -221,3 +271,42 @@ def list_dataset_names(*, refresh: bool = False) -> list[str]:
 
 def list_datasets(*, refresh: bool = False) -> list[Dataset]:
     return [get_dataset(n) for n in list_dataset_names(refresh=refresh)]
+
+
+# --------------------------------------------------------------------------- #
+# Manual discovery (snapshot) mode
+# --------------------------------------------------------------------------- #
+def rescan() -> list[Dataset]:
+    """Walk the whole data root once and serve lookups from that snapshot only.
+
+    Calling this switches the catalog into manual mode (if it was not already). The new
+    snapshot is built off-lock and swapped in atomically, so in-flight requests keep
+    seeing a consistent catalog while the walk runs.
+    """
+    global _snapshot, _snapshot_at
+    found: dict[str, Dataset] = {}
+    if DATA_ROOT.is_dir():
+        for entry in os.scandir(DATA_ROOT):
+            if entry.is_dir():
+                ds = _discover(entry.name)
+                if ds is not None:
+                    found[entry.name] = ds
+    with _lock:
+        _snapshot = found
+        _snapshot_at = time.time()
+        _cache.clear()
+    return [found[n] for n in sorted(found)]
+
+
+def last_scan_time() -> float | None:
+    """Unix time of the last :func:`rescan`, or None in automatic (TTL) mode."""
+    return _snapshot_at if _snapshot is not None else None
+
+
+def enable_auto_discovery() -> None:
+    """Leave manual mode: back to TTL-cached, on-demand discovery."""
+    global _snapshot, _snapshot_at
+    with _lock:
+        _snapshot = None
+        _snapshot_at = None
+        _cache.clear()

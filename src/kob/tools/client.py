@@ -1,20 +1,33 @@
 """Reference Python client (install extra: ``kob[client]``).
 
-Two transports: **Flight** (the product's fast, default path, on :8815) and **HTTP-Arrow**
-(the Arrow-over-HTTP demo server, on :8001).
+Three transports:
+
+* **Flight** — the product's fast, default path (``kob``, on :8815);
+* **REST** — ``kob --mode rest``: Arrow IPC over plain HTTP (:8000), with per-dataset
+  Swagger and a manual rescan (:func:`reload_rest`);
+* **HTTP-Arrow** — the Arrow-over-HTTP demo server (``kob-demo-arrow``, on :8001).
 
 Importable API::
 
-    from kob.tools.client import query_flight, query_http
+    from kob.tools.client import query_flight, query_rest, query_http, reload_rest
     from kob.core.contract import QueryRequest, Filter
 
     tbl = query_flight("grpc://127.0.0.1:8815",
                        QueryRequest(dataset="events",
                                     filters=[Filter("region", "=", "eu")]))
+    tbl = query_rest("http://127.0.0.1:8000", QueryRequest(dataset="events", limit=10))
+    tbl = query_rest_params("http://127.0.0.1:8000", "events", region=["eu", "us"], limit=10)
+    tbl = query_rest("http://127.0.0.1:8000",
+                     QueryRequest(dataset="prices", start="2024-01-01", end="2024-03-31"))
+    reload_rest("http://127.0.0.1:8000")      # rescan Parquet on the server
 
 CLI::
 
     kob-client --dataset events --filter 'region:=:eu' --filter 'amount:>=:100'
+    kob-client --transport rest --dataset events --columns user_id,amount --limit 10
+    kob-client --transport rest --reload --dataset events      # rescan first, then query
+    kob-client --transport rest --dataset prices --start 2024-01-01 --end 2024-03-31
+    kob-client --dataset dividends --range ex_date=2024-01-01..2024-03-31 --range pay_date=..2024-06-30
     kob-client --transport http --dataset events --columns user_id,amount --limit 10
 """
 
@@ -54,8 +67,70 @@ def query_http(base_url: str, req: QueryRequest, compression: str = "zstd") -> p
     return pa.ipc.open_stream(resp.raw).read_all()
 
 
+def _read_arrow(resp: requests.Response) -> pa.Table:
+    if not resp.ok:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise requests.HTTPError(f"{resp.status_code} {resp.reason}: {detail}", response=resp)
+    resp.raw.decode_content = True
+    return pa.ipc.open_stream(resp.raw).read_all()
+
+
+def query_rest(base_url: str, req: QueryRequest, compression: str = "zstd",
+               timeout: float = 600) -> pa.Table:
+    """POST the JSON contract to ``kob --mode rest`` and read back the Arrow IPC stream.
+
+    ``compression`` is the Arrow IPC buffer codec the server should use
+    (``zstd`` / ``lz4`` / ``none``); pyarrow decodes any of them transparently.
+    """
+    body = req.to_dict()
+    body.pop("dataset")  # the dataset is in the path
+    resp = requests.post(
+        f"{base_url.rstrip('/')}/data/{req.dataset}",
+        params={"format": "arrow", "compression": compression},
+        json=body,
+        stream=True,
+        timeout=timeout,
+    )
+    return _read_arrow(resp)
+
+
+def query_rest_params(base_url: str, dataset: str, *, compression: str = "zstd",
+                      timeout: float = 600, **params: object) -> pa.Table:
+    """GET ``/data/{dataset}`` with the typed query parameters shown in the REST Swagger.
+
+    Keyword args map to query parameters: ``region=["eu", "us"]`` (IN),
+    ``amount__min=100`` / ``amount__max=500`` (→ ``amount.min`` / ``amount.max``),
+    ``columns=["a", "b"]``, ``filter=["strike:>:100"]``, ``start="2024-01-01"``,
+    ``end="2024-03-31"``, ``ex_date__start="2024-01-01"`` / ``ex_date__end=...`` (a range on
+    any date column → ``ex_date.start`` / ``ex_date.end``), ``limit=10``.
+    """
+    query: list[tuple[str, object]] = [("format", "arrow"), ("compression", compression)]
+    for k, v in params.items():
+        for suffix in ("__min", "__max", "__start", "__end"):
+            if k.endswith(suffix):
+                k = f"{k[:-len(suffix)]}.{suffix[2:]}"
+                break
+        if k == "columns" and isinstance(v, (list, tuple)):
+            v = ",".join(map(str, v))
+        for item in v if isinstance(v, (list, tuple)) else [v]:
+            query.append((k, str(item).lower() if isinstance(item, bool) else item))
+    resp = requests.get(f"{base_url.rstrip('/')}/data/{dataset}", params=query,
+                        stream=True, timeout=timeout)
+    return _read_arrow(resp)
+
+
+def reload_rest(base_url: str, timeout: float = 600) -> dict:
+    """Ask ``kob --mode rest`` to rescan its data root (same as the Swagger Reload button)."""
+    resp = requests.post(f"{base_url.rstrip('/')}/reload", timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def list_datasets_http(base_url: str) -> dict:
-    """List datasets from the Swagger control plane (default :8000)."""
+    """List datasets from the Swagger control plane / REST server (default :8000)."""
     return requests.get(f"{base_url.rstrip('/')}/datasets", timeout=30).json()
 
 
@@ -78,13 +153,23 @@ def _req_from_args(args: argparse.Namespace) -> QueryRequest:
         col, op, val = raw.split(":", 2)
         filters.append(Filter(col, op, _coerce(val)))
     columns = [c.strip() for c in args.columns.split(",")] if args.columns else None
-    return QueryRequest(dataset=args.dataset, columns=columns, filters=filters, limit=args.limit)
+    ranges: dict[str, dict[str, str | None]] = {}
+    for raw in args.range or []:
+        col, _, span = raw.partition("=")
+        start, sep, end = span.partition("..")
+        if not col or not sep:
+            raise SystemExit(f"--range must be 'column=start..end' (either side optional), got {raw!r}")
+        ranges[col] = {"start": start or None, "end": end or None}
+    return QueryRequest(dataset=args.dataset, columns=columns, filters=filters, limit=args.limit,
+                        start=args.start, end=args.end, date_column=args.date_column,
+                        ranges=ranges)
 
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Query a kob server.")
-    p.add_argument("--transport", choices=["flight", "http"], default="flight",
-                   help="flight = the fast default (:8815); http = the Arrow-over-HTTP demo (:8001).")
+    p.add_argument("--transport", choices=["flight", "rest", "http"], default="flight",
+                   help="flight = the fast default (:8815); rest = `kob --mode rest` (:8000); "
+                        "http = the Arrow-over-HTTP demo (:8001).")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int)
     p.add_argument("--dataset", required=True)
@@ -92,14 +177,29 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--filter", action="append",
                    help="Filter 'column:op:value' (repeatable), e.g. 'region:=:eu' or 'amount:>=:100'.")
     p.add_argument("--limit", type=int)
+    p.add_argument("--start", help="Inclusive start date (ISO) on the dataset's date column.")
+    p.add_argument("--end", help="Inclusive end date (ISO) on the dataset's date column.")
+    p.add_argument("--date-column", help="Column for --start/--end (default: auto-detected).")
+    p.add_argument("--range", action="append",
+                   help="Date range on any date column, 'column=start..end' (repeatable; either "
+                        "side optional), e.g. 'ex_date=2024-01-01..2024-03-31' or 'pay_date=..2024-06-30'.")
     p.add_argument("--compression", default="zstd", choices=["zstd", "lz4", "none"])
     p.add_argument("--head", type=int, default=5, help="Rows to preview.")
+    p.add_argument("--reload", action="store_true",
+                   help="rest only: rescan the server's Parquet before querying.")
     args = p.parse_args(argv)
 
     req = _req_from_args(args)
+    if args.reload:
+        if args.transport != "rest":
+            p.error("--reload only applies to --transport rest")
+        info = reload_rest(f"http://{args.host}:{args.port or 8000}")
+        print(f"reloaded: {len(info['datasets'])} dataset(s) in {info['elapsed_ms']} ms")
     t0 = time.perf_counter()
     if args.transport == "flight":
         table = query_flight(f"grpc://{args.host}:{args.port or 8815}", req)
+    elif args.transport == "rest":
+        table = query_rest(f"http://{args.host}:{args.port or 8000}", req, compression=args.compression)
     else:
         table = query_http(f"http://{args.host}:{args.port or 8001}", req, compression=args.compression)
     dt = time.perf_counter() - t0

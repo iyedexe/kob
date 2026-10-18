@@ -64,6 +64,31 @@ def _csv_bytes(reader: pa.RecordBatchReader) -> bytes:
     return buf.getvalue().to_pybytes()
 
 
+def dataset_facets(name: str, columns: str, distinct: bool) -> dict:
+    """Facets for a comma-separated column list: partitions from folder names, data columns via DuckDB."""
+    try:
+        ds = get_dataset(name)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    wanted = [c.strip() for c in columns.split(",") if c.strip()]
+    out: dict[str, dict] = {}
+    data_cols = []
+    for c in wanted:
+        if c in ds.partition_cols:
+            # Partition filters come straight from the folder names — free, no scan.
+            out[c] = {"type": "partition", "values": ds.partition_values.get(c, [])}
+        elif c in ds.allowed_columns:
+            data_cols.append(c)
+        else:
+            raise HTTPException(400, f"Unknown column '{c}' for dataset '{name}'")
+    if data_cols:
+        try:
+            out.update(engine.column_facets(name, data_cols, distinct=distinct))
+        except duckdb.Error as exc:
+            raise HTTPException(400, f"Facet query failed: {exc}") from None
+    return {"dataset": name, "facets": out}
+
+
 # --------------------------------------------------------------------------- #
 # Request models — typed so Swagger documents the body and "Try it out" works
 # --------------------------------------------------------------------------- #
@@ -79,6 +104,18 @@ class QueryModel(BaseModel):
     filters: list[FilterModel] = Field(
         default_factory=list, description="AND-ed; may target data columns or partition (folder) keys.")
     limit: int | None = Field(None, ge=1, description="Optional row cap.")
+    start: str | None = Field(None, description="Inclusive start (ISO date/datetime) on the date column.",
+                              examples=["2026-06-01"])
+    end: str | None = Field(None, description="Inclusive end (ISO date/datetime) on the date column.",
+                            examples=["2026-06-30"])
+    date_column: str | None = Field(
+        None, description="Column for start/end; defaults to the dataset's detected date column "
+                          "(see `date_column` in GET /datasets/{name}).")
+    ranges: dict[str, dict[str, str | None]] = Field(
+        default_factory=dict,
+        description="Inclusive start/end on any date column (see `date_columns` in "
+                    "GET /datasets/{name}), AND-ed; either side optional.",
+        examples=[{"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}}])
 
     model_config = {
         "json_schema_extra": {
@@ -156,27 +193,7 @@ def create_app(flight_location: str = DEFAULT_FLIGHT_LOCATION) -> FastAPI:
         columns: str = Query(..., description="Comma-separated columns."),
         distinct: bool = False,
     ) -> dict:
-        try:
-            ds = get_dataset(name)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from None
-        wanted = [c.strip() for c in columns.split(",") if c.strip()]
-        out: dict[str, dict] = {}
-        data_cols = []
-        for c in wanted:
-            if c in ds.partition_cols:
-                # Partition filters come straight from the folder names — free, no scan.
-                out[c] = {"type": "partition", "values": ds.partition_values.get(c, [])}
-            elif c in ds.allowed_columns:
-                data_cols.append(c)
-            else:
-                raise HTTPException(400, f"Unknown column '{c}' for dataset '{name}'")
-        if data_cols:
-            try:
-                out.update(engine.column_facets(name, data_cols, distinct=distinct))
-            except duckdb.Error as exc:
-                raise HTTPException(400, f"Facet query failed: {exc}") from None
-        return {"dataset": name, "facets": out}
+        return dataset_facets(name, columns, distinct)
 
     @app.get("/flight", tags=["Flight"], summary="How to pull results over Arrow Flight (the fast path)")
     def flight_info() -> dict:

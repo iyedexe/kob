@@ -10,6 +10,7 @@ clients that want Arrow without gRPC.
 | **Flight** (data, fast) | `uv run kob` | **8815** | Arrow IPC over gRPC |
 | **Swagger** (discovery + interop) | `uv run kob` | **8000** | discovery, `POST /query` (JSON/CSV), `/docs` |
 | Arrow-over-HTTP **demo** | `uv run kob-demo-arrow` | 8001 | Arrow IPC over plain HTTP |
+| **REST mode** (alternative to the above) | `uv run kob --mode rest` | 8000 | Arrow IPC over HTTP at `/data/{dataset}`, per-dataset Swagger, `POST /reload` |
 
 `uv run kob` starts **Flight + Swagger together**. Start `kob-demo-arrow` only if you want
 the HTTP-Arrow path.
@@ -31,9 +32,16 @@ uv sync --extra client
 uv run kob-client --dataset optionmetrics --filter 'underlying:=:AAPL' --filter 'year:=:2023' --columns date,strike,impl_vol,delta --limit 5
 # Arrow-over-HTTP demo (start `kob-demo-arrow` first):
 uv run kob-client --transport http --port 8001 --dataset georev --filter 'year:=:2023' --columns company_id,region,revenue_usd --limit 5
+# REST mode (start `kob --mode rest` first); --reload rescans the server's Parquet first:
+uv run kob-client --transport rest --reload --dataset georev --filter 'year:=:2023' --limit 5
+# Date range on the dataset's date column (any transport):
+uv run kob-client --dataset optionmetrics --start 2023-03-01 --end 2023-03-31 --limit 5
+# Ranges on any date column(s), either side optional:
+uv run kob-client --dataset optionmetrics --range date=2023-03-01..2023-03-31 --range expiry=..2023-04-30 --limit 5
 ```
 
-Importable API: `from kob.tools.client import query_flight, query_http`.
+Importable API: `from kob.tools.client import query_flight, query_http, query_rest,
+query_rest_params, reload_rest`.
 
 ## C# / .NET  (`clients/csharp/`)
 

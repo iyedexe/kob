@@ -188,6 +188,165 @@ def test_stream_json_nan_inf_are_null():
     assert all(v is None or math.isfinite(v) for v in vals)
 
 
+# --------------------------------------------------------------------------- #
+# start / end date range
+# --------------------------------------------------------------------------- #
+def test_start_end_on_detected_date_column():
+    import datetime as dt
+
+    _reset("closes")
+    days = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(10)]
+    _write("closes/year=2024/p.parquet", pa.table({
+        "listed": [dt.date(2000, 1, 1)] * 10, "trade_date": days, "close": [float(i) for i in range(10)]}))
+    ds = catalog.get_dataset("closes")
+    assert ds.date_column == "trade_date"  # preferred name beats schema order
+    assert set(ds.date_columns) == {"listed", "trade_date"}
+    out = _q(dataset="closes", start="2024-01-03", end="2024-01-05")
+    assert out["close"].to_pylist() == [2.0, 3.0, 4.0]  # both ends inclusive
+    assert _q(dataset="closes", start="2024-01-09").num_rows == 2
+    assert _q(dataset="closes", end="2024-01-01").num_rows == 1
+    assert _q(dataset="closes", start="2000-01-01", end="2000-01-01", date_column="listed").num_rows == 10
+    # round-trips through the JSON contract (Flight / POST)
+    req = QueryRequest.from_dict(QueryRequest(dataset="closes", start="2024-01-02", end="2024-01-02").to_dict())
+    assert engine.execute_reader(req).read_all().num_rows == 1
+    for bad in (dict(start="2024-01-05", end="2024-01-01"), dict(start="not-a-date"),
+                dict(start="2024-01-01", date_column="nope")):
+        try:
+            build_sql(QueryRequest(dataset="closes", **bad))
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+
+
+def test_end_date_covers_whole_day_on_timestamps():
+    import datetime as dt
+
+    _reset("ticks")
+    ts = [dt.datetime(2024, 1, 1, 9), dt.datetime(2024, 1, 1, 17, 30), dt.datetime(2024, 1, 2, 9)]
+    _write("ticks/p.parquet", pa.table({"ts": ts, "px": [1.0, 2.0, 3.0]}))
+    assert catalog.get_dataset("ticks").date_column == "ts"
+    assert _q(dataset="ticks", start="2024-01-01", end="2024-01-01").num_rows == 2
+    assert _q(dataset="ticks", end="2024-01-01T12:00:00").num_rows == 1
+
+
+def test_iso_date_partition_is_a_date_column():
+    _reset("daily")
+    for d in ("2024-01-01", "2024-01-02", "2024-01-03"):
+        _write(f"daily/dt={d}/p.parquet", pa.table({"v": [1]}))
+    ds = catalog.get_dataset("daily")
+    assert ds.date_column == "dt"
+    assert _q(dataset="daily", start="2024-01-02", end="2024-01-03").num_rows == 2
+    _reset("nodates")
+    _write("nodates/p.parquet", pa.table({"v": [1]}))
+    try:
+        build_sql(QueryRequest(dataset="nodates", start="2024-01-01"))
+        raise AssertionError("expected ValueError: no date column")
+    except ValueError as exc:
+        assert "no date" in str(exc)
+
+
+def test_ranges_on_any_date_column():
+    import datetime as dt
+
+    from kob.server.rest import create_rest_app, request_from_query_params
+
+    _reset("divs")
+    ex = [dt.date(2024, m, 1) for m in (1, 2, 3, 4)]
+    pay = [dt.date(2024, m, 15) for m in (2, 3, 4, 5)]
+    _write("divs/p.parquet", pa.table({"ex_date": ex, "pay_date": pay, "amount": [1.0, 2.0, 3.0, 4.0]}))
+    ds = catalog.get_dataset("divs")
+    assert set(ds.date_columns) == {"ex_date", "pay_date"}
+    # Two date columns at once, AND-ed; open-ended sides allowed.
+    out = _q(dataset="divs", ranges={"ex_date": {"start": "2024-02-01", "end": "2024-04-01"},
+                                     "pay_date": {"end": "2024-04-15"}})
+    assert out["amount"].to_pylist() == [2.0, 3.0]
+    # JSON round trip (Flight / POST)
+    req = QueryRequest.from_dict({"dataset": "divs", "ranges": {"pay_date": {"start": "2024-05-15"}}})
+    assert engine.execute_reader(req).read_all()["amount"].to_pylist() == [4.0]
+    for bad in ({"amount": {"start": "2024-01-01"}},            # not a date column
+                {"ex_date": {"start": "2024-05-01", "end": "2024-01-01"}},
+                {"ex_date": {"from": "2024-01-01"}}):            # unknown key
+        try:
+            build_sql(QueryRequest.from_dict({"dataset": "divs", "ranges": bad}))
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+    # REST: <col>.start / <col>.end in the generated spec and the GET parser
+    try:
+        app = create_rest_app()
+        names = {p["name"] for p in app.openapi()["paths"]["/data/divs"]["get"]["parameters"]}
+        assert {"ex_date.start", "ex_date.end", "pay_date.start", "pay_date.end"} <= names
+        assert "ex_date.min" not in names
+        req = request_from_query_params(catalog.get_dataset("divs"),
+                                        [("ex_date.start", "2024-03-01"), ("pay_date.end", "")])
+        assert req.ranges == {"ex_date": {"start": "2024-03-01", "end": None}}
+        assert engine.execute_reader(req).read_all().num_rows == 2
+    finally:
+        catalog.enable_auto_discovery()
+
+
+# --------------------------------------------------------------------------- #
+# REST mode (manual discovery, per-dataset OpenAPI, Arrow IPC)
+# --------------------------------------------------------------------------- #
+def test_manual_discovery_only_changes_on_rescan():
+    _reset("manual")
+    _write("manual/k=a/p.parquet", pa.table({"x": [1]}))
+    try:
+        assert "manual" in [d.name for d in catalog.rescan()]
+        _write("manual2/p.parquet", pa.table({"y": [1]}))
+        assert "manual2" not in catalog.list_dataset_names(), "manual mode walked the tree"
+        try:
+            catalog.get_dataset("manual2")
+            raise AssertionError("expected KeyError before rescan")
+        except KeyError:
+            pass
+        catalog.rescan()
+        assert catalog.get_dataset("manual2").data_columns == {"y": "int64"}
+    finally:
+        catalog.enable_auto_discovery()
+        _reset("manual2")
+
+
+def test_rest_query_params_and_openapi():
+    from kob.server.rest import create_rest_app, request_from_query_params
+
+    _reset("restds")
+    _write("restds/region=eu/p.parquet", pa.table({"amount": [1.0, 5.0], "n": [1, 2], "ok": [True, False]}))
+    _write("restds/region=us/p.parquet", pa.table({"amount": [9.0], "n": [3], "ok": [True]}))
+    try:
+        app = create_rest_app()
+        spec = app.openapi()
+        get = spec["paths"]["/data/restds"]["get"]
+        names = {p["name"]: p for p in get["parameters"]}
+        assert names["region"]["schema"]["items"]["enum"] == ["eu", "us"]
+        assert {"amount.min", "amount.max", "n", "ok", "columns", "limit"} <= set(names)
+        assert "amount" not in names  # no exact-match param on floats
+
+        ds = catalog.get_dataset("restds")
+        req = request_from_query_params(ds, [
+            ("columns", "amount,region"), ("region", "eu"), ("amount.min", "2"),
+            ("ok", "false"), ("filter", "n:in:1,2"), ("limit", "10"), ("format", "arrow")])
+        out = engine.execute_reader(req).read_all()
+        assert out.column_names == ["amount", "region"] and out["amount"].to_pylist() == [5.0]
+        try:
+            request_from_query_params(ds, [("bogus", "1")])
+            raise AssertionError("expected ValueError for an unknown parameter")
+        except ValueError:
+            pass
+    finally:
+        catalog.enable_auto_discovery()
+
+
+def test_arrow_ipc_stream_round_trips():
+    from kob.server.rest import stream_arrow_ipc
+
+    _events2()
+    for comp in ("none", "zstd"):
+        payload = b"".join(stream_arrow_ipc(engine.execute_reader(QueryRequest(dataset="events2")), comp))
+        table = pa.ipc.open_stream(payload).read_all()
+        assert table.num_rows == 1 and "amount" in table.column_names
+
+
 if __name__ == "__main__":
     failures = 0
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]

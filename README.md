@@ -17,6 +17,14 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob
 #   docs  (Swagger)  HTTP            http://127.0.0.1:8000/docs
 ```
 
+No gRPC where you are? Run it as one plain-HTTP server that still serves Arrow, with a
+Swagger UI generated from your datasets ([REST mode](#rest-mode--kob---mode-rest)):
+
+```bash
+KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 8000
+#   data + docs      HTTP           http://127.0.0.1:8000/docs
+```
+
 ---
 
 ## Why kob exists
@@ -84,6 +92,73 @@ three **core** modules feed every transport:
 One process, one discovery cache, one DuckDB. You don't choose a transport at deploy time —
 you get both, and clients use whichever fits.
 
+## REST mode — `kob --mode rest`
+
+When gRPC isn't an option (proxies, firewalls, browsers, plain-HTTP tooling), run kob as a
+**single HTTP server** that still serves **Apache Arrow**:
+
+```bash
+KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
+#   data + docs      HTTP           http://127.0.0.1:9000/docs
+```
+
+- **Swagger generated from your data.** Every discovered dataset gets its own section with
+  typed endpoints. `GET /data/{dataset}` has one query parameter per column:
+  - partition keys and string columns → multi-select pickers (`IN`), filled with real values;
+  - date/timestamp columns → `col.start` / `col.end` (inclusive range), plus `start` / `end`
+    as a shorthand for the dataset's main date column;
+  - numeric columns → `col` (exact, integers) and `col.min` / `col.max` (range);
+  - `columns` (projection, an enum of the dataset's columns), `filter` (`col:op:value`), `limit`.
+
+  `POST /data/{dataset}` takes the usual JSON contract, with column names as enums.
+- **Arrow over REST.** Responses are an Arrow IPC stream (`application/vnd.apache.arrow.stream`,
+  `?compression=none|zstd|lz4`). `?format=json|csv` is there for eyeballing results in Swagger.
+- **Manual discovery.** The tree is scanned **once at startup** and then only when you press
+  **Reload datasets** in the Swagger UI (or `POST /reload`). No request ever triggers a tree
+  walk, so a huge data root costs nothing on the hot path. Reload rebuilds the Swagger spec,
+  so new datasets, columns and partition values show up immediately.
+
+```python
+from kob.tools.client import query_rest, query_rest_params, reload_rest
+from kob.core.contract import QueryRequest, Filter
+
+base = "http://127.0.0.1:9000"
+reload_rest(base)                                         # rescan Parquet
+tbl = query_rest(base, QueryRequest(dataset="optionmetrics",
+                                    filters=[Filter("underlying", "in", ["AAPL", "MSFT"])]))
+tbl = query_rest_params(base, "optionmetrics", underlying=["AAPL"],
+                        start="2023-03-01", end="2023-03-31", strike__min=100)
+tbl = query_rest(base, QueryRequest(dataset="dividends", ranges={
+          "ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
+          "pay_date": {"end": "2024-06-30"}}))
+```
+
+## Arrow Flight vs Arrow over REST
+
+Both carry **the same bytes** — Arrow IPC record batches, nothing to decode row by row. What
+differs is the envelope around them:
+
+| | Flight (`kob`, gRPC `:8815`) | Arrow over REST (`kob --mode rest`) |
+|---|---|---|
+| Protocol | gRPC on HTTP/2 | plain HTTP — one request, Arrow IPC body |
+| Client needs | a Flight library (pyarrow, Arrow C++/C#/Java/Go/Rust) | any HTTP client + an Arrow IPC reader (`curl`, `requests`, browsers/JS) |
+| Round trips | 2 (`GetFlightInfo` → `DoGet`); schema known before any data | 1; schema at the head of the body |
+| Scale-out | multiple endpoints per query, parallel streams, HTTP/2 multiplexing | one stream per request |
+| Errors | gRPC status, also mid-stream | HTTP status up front; a mid-stream error truncates the stream |
+| Infrastructure | needs gRPC-aware proxies/LBs end to end | works through anything that speaks HTTP: gateways, WAFs, CDNs, Swagger |
+| Discovery | `/docs` control plane on `:8000` | per-dataset Swagger generated from the data, with **Reload** |
+| Discovery refresh | automatic (TTL cache) | manual (startup + Reload / `POST /reload`) |
+
+Measured on one localhost stream they are neck and neck (1.75M rows: Flight 67 ms vs
+HTTP-Arrow 72 ms) — both 150–1750× faster than JSON ([report](docs/PERFORMANCE_REPORT.md)).
+Flight pulls ahead under concurrency and with parallel endpoints; REST wins on reach. Use
+`compression=none` on a LAN and `zstd` across a WAN. The query contract is identical, so a
+client switches with one call: `query_flight(...)` ↔ `query_rest(...)`.
+
+**Pick Flight** for service-to-service bulk pulls on a network you control. **Pick REST**
+when gRPC is blocked or awkward — corporate proxies, API gateways, browsers, Excel/Power
+Query, `curl` scripts — or when people should explore the data through Swagger.
+
 ## Project layout
 
 ```
@@ -92,9 +167,10 @@ src/kob/
     catalog.py    filesystem auto-discovery (datasets, partitions, columns)
     contract.py   the JSON query contract + parameterised SQL builder
     engine.py     DuckDB execution → streaming Apache Arrow
-  server/    the `kob` entry point (Flight + Swagger, started together)
+  server/    the `kob` entry point (Flight + Swagger, started together; or --mode rest)
     flight.py     Arrow Flight server (the fast, default data path)
     api.py        FastAPI app: Swagger UI, discovery, /flight how-to, interactive /query
+    rest.py       `--mode rest`: Arrow over HTTP, per-dataset Swagger, manual Reload
     app.py        main(): runs Flight on a thread + the Swagger app in the foreground
   demos/     secondary transports — here only to demonstrate the alternatives
     arrow_http/   Arrow IPC over plain HTTP
@@ -160,6 +236,16 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 ```
 
 - **Operators:** `= != <> < <= > >= like "not like" ilike in "not in"`.
+- **Date range:** `"start": "2024-01-01", "end": "2024-03-31"` (both inclusive) filters the
+  dataset's date column. kob picks it at discovery (a column named `date`, `trade_date`,
+  `as_of_date`, … or the first date/timestamp column; a `dt=2024-01-01` folder also counts),
+  shown as `date_column` in `GET /datasets/{name}`. Pass `"date_column": "ex_date"` to use
+  another one. A date-only `end` on a timestamp column covers that whole day.
+- **Ranges on any date column:** every date/timestamp column (listed as `date_columns`) can
+  take its own start/end, several at once (AND-ed), either side optional:
+  `"ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}, "pay_date": {"end": "2024-06-30"}}`.
+  In REST mode the GET form has `ex_date.start` / `ex_date.end` for each date column; the CLI
+  takes `--range ex_date=2024-01-01..2024-03-31`.
 - **Filters** may target data columns **or** partition keys — partition filters prune whole
   folders before any file is read.
 - For large or latency-sensitive pulls, use **Flight**; the HTTP `/query` is for
@@ -188,6 +274,8 @@ Append `?refresh=true` to `/datasets` or `/datasets/{name}` to bypass the discov
 | `KOB_DUCKDB_THREADS` | all cores | DuckDB threads |
 
 CLI: `kob --host 0.0.0.0 --flight-port 8815 --http-port 8000 --threads 0`
+or `kob --mode rest --host 0.0.0.0 --port 8000` (`KOB_DISCOVERY_TTL` doesn't apply in REST
+mode — discovery there is manual).
 
 ## Demos & benchmark
 
@@ -216,8 +304,9 @@ the best Protobuf** ([full report](docs/PERFORMANCE_REPORT.md)).
 ## Clients
 
 Working clients for **Python, C#, C++ and Excel** — see [`clients/`](clients/README.md).
-All speak the JSON contract above. Flight (`:8815`) is the recommended transport; Excel and
-other HTTP-only consumers use the Swagger server's JSON/CSV `/query` (`:8000`).
+All speak the JSON contract above. Flight (`:8815`) is the recommended transport; HTTP-only
+consumers can use `kob --mode rest` (Arrow over HTTP, `query_rest` in the Python client) or,
+for Excel, the Swagger server's JSON/CSV `/query` (`:8000`).
 
 ## Why Arrow + Flight?
 

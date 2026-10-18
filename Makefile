@@ -1,5 +1,5 @@
 # Convenience targets. Requires: uv, (optional) dotnet, cmake + apache-arrow for C++.
-.PHONY: help setup test data data-small data-medium data-large serve flight \
+.PHONY: help setup test data data-small data-medium data-large serve rest flight \
         demo-arrow demo-json demo-proto notebook bench \
         client csharp-build csharp-run cpp-build cpp-run clean clean-data
 
@@ -24,6 +24,8 @@ data: data-small ## Alias for data-small
 
 serve:           ## Run kob: Arrow Flight (:8815) + Swagger UI (http://localhost:8000/docs)
 	uv run kob
+rest:            ## Run kob in REST mode: Arrow over HTTP + per-dataset Swagger (http://localhost:8000/docs)
+	uv run kob --mode rest --port 8000
 flight:          ## Run Flight only, standalone, on :8815 (no Swagger)
 	uv run kob-flight
 demo-arrow:      ## Run the Arrow-IPC-over-HTTP demo server on :8001
