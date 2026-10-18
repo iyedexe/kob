@@ -7,20 +7,25 @@ Three transports:
   Swagger and a manual rescan (:func:`reload_rest`);
 * **HTTP-Arrow** — the Arrow-over-HTTP demo server (``kob-demo-arrow``, on :8001).
 
-Importable API::
+Slicing API (Flight or REST, picked from the URL)::
+
+    from kob.tools.client import KobClient
+
+    kob = KobClient("http://127.0.0.1:8000")          # or KobClient("grpc://127.0.0.1:8815")
+    om = kob["optionmetrics"]
+    tbl = om.query(om.date["2023-03-01":"2023-03-31"],  # inclusive at BOTH ends
+                   om.strike[90:],                      # open end
+                   underlying=["AAPL", "MSFT"], cp_flag="C", limit=1000)
+    kob.reload()                                        # REST: rescan Parquet on the server
+
+Slices work on sliceable columns (dates, timestamps, numbers) and mean start/end: unlike
+Python lists, ``col[a:b]`` *includes* ``b``.
+
+Low-level functions (take a :class:`~kob.core.contract.QueryRequest`)::
 
     from kob.tools.client import query_flight, query_rest, query_http, reload_rest
-    from kob.core.contract import QueryRequest, Filter
-
-    tbl = query_flight("grpc://127.0.0.1:8815",
-                       QueryRequest(dataset="events",
-                                    filters=[Filter("region", "=", "eu")]))
+    tbl = query_flight("grpc://127.0.0.1:8815", QueryRequest(dataset="events"))
     tbl = query_rest("http://127.0.0.1:8000", QueryRequest(dataset="events", limit=10))
-    tbl = query_rest_params("http://127.0.0.1:8000", "events", region=["eu", "us"], limit=10)
-    tbl = query_rest("http://127.0.0.1:8000",
-                     QueryRequest(dataset="prices",
-                                  ranges={"date": {"start": "2024-01-01", "end": "2024-03-31"}}))
-    reload_rest("http://127.0.0.1:8000")      # rescan Parquet on the server
 
 CLI::
 
@@ -37,6 +42,8 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import dataclass
+from typing import Any
 
 import pyarrow as pa
 import requests
@@ -98,31 +105,6 @@ def query_rest(base_url: str, req: QueryRequest, compression: str = "zstd",
     return _read_arrow(resp)
 
 
-def query_rest_params(base_url: str, dataset: str, *, compression: str = "zstd",
-                      timeout: float = 600, **params: object) -> pa.Table:
-    """GET ``/data/{dataset}`` with the typed query parameters shown in the REST Swagger.
-
-    Keyword args map to query parameters: ``region=["eu", "us"]`` (IN),
-    ``amount__min=100`` / ``amount__max=500`` (→ ``amount.min`` / ``amount.max``),
-    ``columns=["a", "b"]``, ``filter=["strike:>:100"]``,
-    ``ex_date__start="2024-01-01"`` / ``ex_date__end=...`` (a date range on that column →
-    ``ex_date.start`` / ``ex_date.end``), ``limit=10``.
-    """
-    query: list[tuple[str, object]] = [("format", "arrow"), ("compression", compression)]
-    for k, v in params.items():
-        for suffix in ("__min", "__max", "__start", "__end"):
-            if k.endswith(suffix):
-                k = f"{k[:-len(suffix)]}.{suffix[2:]}"
-                break
-        if k == "columns" and isinstance(v, (list, tuple)):
-            v = ",".join(map(str, v))
-        for item in v if isinstance(v, (list, tuple)) else [v]:
-            query.append((k, str(item).lower() if isinstance(item, bool) else item))
-    resp = requests.get(f"{base_url.rstrip('/')}/data/{dataset}", params=query,
-                        stream=True, timeout=timeout)
-    return _read_arrow(resp)
-
-
 def reload_rest(base_url: str, timeout: float = 600) -> dict:
     """Ask ``kob --mode rest`` to rescan its data root (same as the Swagger Reload button)."""
     resp = requests.post(f"{base_url.rstrip('/')}/reload", timeout=timeout)
@@ -133,6 +115,146 @@ def reload_rest(base_url: str, timeout: float = 600) -> dict:
 def list_datasets_http(base_url: str) -> dict:
     """List datasets from the Swagger control plane / REST server (default :8000)."""
     return requests.get(f"{base_url.rstrip('/')}/datasets", timeout=30).json()
+
+
+# --------------------------------------------------------------------------- #
+# Slicing API: ds.column[start:end]
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Range:
+    """An inclusive ``start``..``end`` range on one column (either side may be None)."""
+    column: str
+    start: Any = None
+    end: Any = None
+
+
+class Column:
+    """A named column; slice it to get a :class:`Range`: ``col["2024-01-01":"2024-03-31"]``.
+
+    Slices are **inclusive at both ends** (they mean start/end, not Python's half-open
+    ``[a, b)``) and take no step. Works on sliceable columns: dates, timestamps, numbers.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __getitem__(self, key: slice) -> Range:
+        if not isinstance(key, slice):
+            raise TypeError(f"use a slice on a column: {self.name}[start:end], got {key!r}")
+        if key.step is not None:
+            raise ValueError(f"kob slices take no step: {self.name}[start:end]")
+        return Range(self.name, key.start, key.stop)
+
+    def __repr__(self) -> str:
+        return f"Column({self.name!r})"
+
+
+class Dataset:
+    """A dataset on a kob server. Columns are attributes (``ds.date``) or items (``ds["date"]``).
+
+    ::
+
+        om = KobClient("http://127.0.0.1:8000")["optionmetrics"]
+        om.query(om.date["2023-03-01":"2023-03-31"],     # inclusive date range
+                 om.expiry[:"2023-04-30"],                # open start
+                 om.strike[90:110],                       # numeric range
+                 underlying=["AAPL", "MSFT"],             # IN
+                 cp_flag="C",                             # =
+                 columns=["date", "strike", "mid"], limit=1000)
+    """
+
+    def __init__(self, client: "KobClient", name: str) -> None:
+        self._client = client
+        self._name = name
+
+    def __getattr__(self, column: str) -> Column:
+        if column.startswith("_"):
+            raise AttributeError(column)
+        return Column(column)
+
+    def __getitem__(self, column: str) -> Column:
+        return Column(column)
+
+    def __repr__(self) -> str:
+        return f"Dataset({self._name!r})"
+
+    def request(self, *conditions: Range | Filter, columns: list[str] | None = None,
+                limit: int | None = None, **where: Any) -> QueryRequest:
+        """Build the :class:`QueryRequest` that :meth:`query` would send.
+
+        ``conditions`` are column slices (``ds.date["a":"b"]``) or :class:`Filter` objects.
+        Keyword arguments filter by column: a list/tuple → ``in``, a ``slice`` → range,
+        anything else → ``=``.
+        """
+        filters: list[Filter] = []
+        ranges: dict[str, dict[str, Any]] = {}
+
+        def add_range(col: str, start: Any, end: Any) -> None:
+            if col in ranges:
+                raise ValueError(f"two ranges on {col!r}; combine them into one slice")
+            ranges[col] = {"start": start, "end": end}
+
+        for cond in conditions:
+            if isinstance(cond, Range):
+                add_range(cond.column, cond.start, cond.end)
+            elif isinstance(cond, Filter):
+                filters.append(cond)
+            else:
+                raise TypeError(f"expected a column slice or a Filter, got {cond!r}")
+        for col, value in where.items():
+            if isinstance(value, slice):
+                r = Column(col)[value]  # validates: no step
+                add_range(r.column, r.start, r.end)
+            elif isinstance(value, (list, tuple, set)):
+                filters.append(Filter(col, "in", list(value)))
+            else:
+                filters.append(Filter(col, "=", value))
+        return QueryRequest(dataset=self._name, columns=columns, filters=filters, limit=limit,
+                            ranges=ranges)
+
+    def query(self, *conditions: Range | Filter, columns: list[str] | None = None,
+              limit: int | None = None, **where: Any) -> pa.Table:
+        """Run a query and return an Arrow table. See :meth:`request` for the arguments."""
+        return self._client.query(self.request(*conditions, columns=columns, limit=limit, **where))
+
+
+class KobClient:
+    """One client for both transports, picked from the URL scheme.
+
+    ``KobClient("http://host:8000")`` → ``kob --mode rest`` (Arrow over HTTP);
+    ``KobClient("grpc://host:8815")`` → ``kob`` (Arrow Flight).
+    """
+
+    def __init__(self, url: str, compression: str = "zstd", timeout: float = 600) -> None:
+        self.url = url.rstrip("/")
+        self.compression = compression
+        self.timeout = timeout
+        self.transport = "flight" if self.url.startswith(("grpc://", "grpc+tls://")) else "rest"
+
+    def __getitem__(self, dataset: str) -> Dataset:
+        return Dataset(self, dataset)
+
+    def dataset(self, name: str) -> Dataset:
+        return Dataset(self, name)
+
+    def query(self, req: QueryRequest) -> pa.Table:
+        if self.transport == "flight":
+            return query_flight(self.url, req)
+        return query_rest(self.url, req, compression=self.compression, timeout=self.timeout)
+
+    def datasets(self) -> dict:
+        """REST only: the server's datasets (``GET /datasets``)."""
+        self._rest_only("datasets")
+        return list_datasets_http(self.url)
+
+    def reload(self) -> dict:
+        """REST only: rescan the server's Parquet (the Swagger Reload button)."""
+        self._rest_only("reload")
+        return reload_rest(self.url, timeout=self.timeout)
+
+    def _rest_only(self, what: str) -> None:
+        if self.transport != "rest":
+            raise ValueError(f"{what}() needs a REST URL (http://...), not {self.url}")
 
 
 # --------------------------------------------------------------------------- #
@@ -178,8 +300,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="Filter 'column:op:value' (repeatable), e.g. 'region:=:eu' or 'amount:>=:100'.")
     p.add_argument("--limit", type=int)
     p.add_argument("--range", action="append",
-                   help="Date range on any date column, 'column=start..end' (repeatable; either "
-                        "side optional), e.g. 'ex_date=2024-01-01..2024-03-31' or 'pay_date=..2024-06-30'.")
+                   help="Inclusive range on a date/timestamp/numeric column, 'column=start..end' "
+                        "(repeatable; either side optional), e.g. 'ex_date=2024-01-01..2024-03-31', "
+                        "'pay_date=..2024-06-30', 'strike=90..110'.")
     p.add_argument("--compression", default="zstd", choices=["zstd", "lz4", "none"])
     p.add_argument("--head", type=int, default=5, help="Rows to preview.")
     p.add_argument("--reload", action="store_true",

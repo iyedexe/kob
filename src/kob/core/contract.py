@@ -15,14 +15,17 @@
       "limit": 1000000                                    # optional
     }
 
-``ranges`` gives an inclusive start/end to date/timestamp columns, always named explicitly
-(several at once, AND-ed)::
+``ranges`` gives an inclusive start/end to *sliceable* columns — date, timestamp and numeric
+(including ``year=2024``-style integer and ``dt=2024-01-01``-style date folders) — always
+named explicitly, several at once, AND-ed::
 
     "ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
-               "pay_date": {"end": "2024-06-30"}}
+               "pay_date": {"end": "2024-06-30"},
+               "amount": {"start": 0.5}}
 
-Bounds are inclusive ISO dates or datetimes; either side may be omitted; a date-only `end`
-on a timestamp column covers that whole day.
+Bounds are inclusive; either side may be omitted. Dates are ISO dates or datetimes, and a
+date-only `end` on a timestamp column covers that whole day. (The Python client spells this
+as slices: ``ds.ex_date["2024-01-01":"2024-03-31"]``.)
 
 `build_sql` turns that into a parameterised DuckDB statement against the dataset's
 Hive-partitioned Parquet glob. Column/op names are validated against the *discovered*
@@ -58,8 +61,8 @@ class QueryRequest:
     columns: list[str] | None = None
     filters: list[Filter] = field(default_factory=list)
     limit: int | None = None
-    # Any date column -> {"start": iso, "end": iso} (either key optional), AND-ed.
-    ranges: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    # Any sliceable column -> {"start": ..., "end": ...} (inclusive, either optional), AND-ed.
+    ranges: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "QueryRequest":
@@ -90,27 +93,43 @@ class QueryRequest:
             "columns": self.columns,
             "filters": [{"column": f.column, "op": f.op, "value": f.value} for f in self.filters],
             "limit": self.limit,
-            "ranges": self.ranges,
+            "ranges": _ranges_from(self.ranges),  # date objects -> ISO, JSON-safe
         }
 
 
-def _ranges_from(raw: Any) -> dict[str, dict[str, str | None]]:
+def _ranges_from(raw: Any) -> dict[str, dict[str, Any]]:
     if not raw:
         return {}
     if not isinstance(raw, dict):
-        raise ValueError('ranges must be an object: {"<date column>": {"start": ..., "end": ...}}')
-    out: dict[str, dict[str, str | None]] = {}
+        raise ValueError('ranges must be an object: {"<column>": {"start": ..., "end": ...}}')
+    out: dict[str, dict[str, Any]] = {}
     for col, bounds in raw.items():
         if not isinstance(bounds, dict) or not set(bounds) <= {"start", "end"}:
             raise ValueError(f'ranges[{col!r}] must be {{"start": ..., "end": ...}}, got {bounds!r}')
-        out[col] = {"start": _iso_or_none(bounds.get("start")), "end": _iso_or_none(bounds.get("end"))}
+        out[col] = {"start": _bound_or_none(bounds.get("start")), "end": _bound_or_none(bounds.get("end"))}
     return out
 
 
-def _iso_or_none(v: Any) -> str | None:
+def _bound_or_none(v: Any) -> Any:
+    """JSON-safe range bound: numbers stay numbers, dates become ISO strings."""
     if v is None or v == "":
         return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
     return v.isoformat() if isinstance(v, (dt.date, dt.datetime)) else str(v)
+
+
+def _parse_number(name: str, raw: Any) -> int | float:
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return raw
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
 
 
 def _parse_iso(name: str, raw: str) -> dt.date | dt.datetime:
@@ -124,19 +143,27 @@ def _parse_iso(name: str, raw: str) -> dt.date | dt.datetime:
         raise ValueError(f"{name} must be an ISO date or datetime (e.g. 2026-06-01), got {raw!r}") from None
 
 
-def _range_bounds(ds: Dataset, col: str, start_raw: str | None,
-                  end_raw: str | None) -> list[tuple[str, Any]]:
-    """Validate one inclusive start/end on a date column → ``(sql_op, value)`` bounds."""
-    if col not in ds.date_columns:
-        raise ValueError(f"{col!r} is not a date column of '{ds.name}' "
-                         f"(date columns: {list(ds.date_columns)})")
+def _range_bounds(ds: Dataset, col: str, start_raw: Any, end_raw: Any) -> list[tuple[str, Any]]:
+    """Validate one inclusive start/end on a sliceable column → ``(sql_op, value)`` bounds."""
+    kind = ds.sliceable_columns.get(col)
+    if kind is None:
+        raise ValueError(f"{col!r} is not a sliceable (date/timestamp/numeric) column of "
+                         f"'{ds.name}' (sliceable: {list(ds.sliceable_columns)})")
+    if kind == "number":
+        lo = _parse_number(f"{col} start", start_raw) if start_raw is not None else None
+        hi = _parse_number(f"{col} end", end_raw) if end_raw is not None else None
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(f"{col}: start ({start_raw}) is after end ({end_raw})")
+        return [(op, v) for op, v in ((">=", lo), ("<=", hi)) if v is not None]
+    start_raw = _bound_or_none(start_raw)
+    end_raw = _bound_or_none(end_raw)
     start = _parse_iso(f"{col} start", start_raw) if start_raw is not None else None
     end = _parse_iso(f"{col} end", end_raw) if end_raw is not None else None
     bounds: list[tuple[str, Any]] = []
     if start is not None:
         bounds.append((">=", start))
     if end is not None:
-        if not isinstance(end, dt.datetime) and ds.columns.get(col) == "timestamp":
+        if not isinstance(end, dt.datetime) and kind == "timestamp":
             # A date-only end on a timestamp column means "through the end of that day".
             bounds.append(("<", dt.datetime.combine(end + dt.timedelta(days=1), dt.time())))
         else:
@@ -149,7 +176,7 @@ def _range_bounds(ds: Dataset, col: str, start_raw: str | None,
 
 
 def _date_ranges(req: QueryRequest, ds: Dataset) -> list[tuple[str, str, Any]]:
-    """All date-range bounds of a request as ``(column, sql_op, value)``."""
+    """All range bounds of a request as ``(column, sql_op, value)``."""
     out: list[tuple[str, str, Any]] = []
     for col, b in req.ranges.items():
         out += [(col, op, v) for op, v in _range_bounds(ds, col, b.get("start"), b.get("end"))]

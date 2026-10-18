@@ -33,7 +33,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyarrow as pa
@@ -63,9 +63,14 @@ class Dataset:
     allowed_columns: frozenset[str]          # precomputed: hot path for filter validation
     file_count: int
     discovered_at: float
-    # Columns usable in a start/end date range: date/timestamp data columns, plus partition
-    # keys whose folder values are ISO dates. Requests always name the column explicitly.
-    date_columns: tuple[str, ...] = ()
+    # Sliceable columns -> kind ("date" | "timestamp" | "number"): the columns a request can
+    # give an inclusive start/end range. Date/timestamp/numeric data columns, plus partition
+    # keys whose folder values are all ISO dates or all integers.
+    sliceable_columns: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def date_columns(self) -> tuple[str, ...]:
+        return tuple(c for c, k in self.sliceable_columns.items() if k in ("date", "timestamp"))
 
     @property
     def glob(self) -> str:
@@ -82,7 +87,7 @@ class Dataset:
                 for k in self.partition_cols
             ],
             "data_columns": [{"name": c, "type": t} for c, t in self.data_columns.items()],
-            "date_columns": list(self.date_columns),
+            "sliceable_columns": dict(self.sliceable_columns),
         }
 
 
@@ -106,17 +111,24 @@ def _friendly(t: pa.DataType) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Date columns (usable in start/end range queries)
+# Sliceable columns (usable in start/end range queries)
 # --------------------------------------------------------------------------- #
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_INTEGER = re.compile(r"^-?\d+$")
+_SLICE_KIND = {"date": "date", "timestamp": "timestamp",
+               "int64": "number", "double": "number", "decimal": "number"}
 
 
-def _date_columns(data_columns: dict[str, str], part_keys: list[str],
-                  part_values: dict[str, set[str]]) -> tuple[str, ...]:
-    cols = [c for c, t in data_columns.items() if t in ("date", "timestamp")]
-    cols += [k for k in part_keys
-             if part_values.get(k) and all(_ISO_DATE.match(v) for v in part_values[k])]
-    return tuple(cols)
+def _sliceable_columns(data_columns: dict[str, str], part_keys: list[str],
+                       part_values: dict[str, set[str]]) -> dict[str, str]:
+    out = {c: _SLICE_KIND[t] for c, t in data_columns.items() if t in _SLICE_KIND}
+    for k in part_keys:
+        vals = part_values.get(k)
+        if vals and all(_ISO_DATE.match(v) for v in vals):
+            out[k] = "date"
+        elif vals and all(_INTEGER.match(v) for v in vals):
+            out[k] = "number"  # DuckDB infers integer Hive keys (year=2024) as BIGINT
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -173,7 +185,7 @@ def _discover(name: str) -> Dataset | None:
     columns = dict(data_columns)
     for k in part_keys:
         columns.setdefault(k, "string")  # Hive keys arrive as strings (DuckDB re-infers)
-    date_columns = _date_columns(data_columns, part_keys, part_values)
+    sliceable_columns = _sliceable_columns(data_columns, part_keys, part_values)
     return Dataset(
         name=name,
         root=root,
@@ -184,7 +196,7 @@ def _discover(name: str) -> Dataset | None:
         allowed_columns=frozenset(columns),
         file_count=file_count,
         discovered_at=time.monotonic(),
-        date_columns=date_columns,
+        sliceable_columns=sliceable_columns,
     )
 
 

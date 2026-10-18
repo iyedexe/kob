@@ -299,6 +299,10 @@ def _get_operation(ds: Dataset) -> dict:
     }
 
 
+def _bound_schema(kind: str) -> dict:
+    return {"type": "number"} if kind == "number" else {"type": "string", "format": "date"}
+
+
 def _post_operation(ds: Dataset) -> dict:
     col_enum = {"type": "string", "enum": list(ds.columns)}
     example_cols = list(ds.columns)[:4]
@@ -322,13 +326,14 @@ def _post_operation(ds: Dataset) -> dict:
             **({
                 "ranges": {
                     "type": "object",
-                    "description": "Inclusive start/end per date column (AND-ed); either side optional.",
+                    "description": "Inclusive start/end per sliceable (date/timestamp/numeric) "
+                                   "column, AND-ed; either side optional.",
                     "properties": {c: {"type": "object", "properties": {
-                        "start": {"type": "string", "format": "date"},
-                        "end": {"type": "string", "format": "date"}}} for c in ds.date_columns},
+                        "start": _bound_schema(k), "end": _bound_schema(k)}}
+                        for c, k in ds.sliceable_columns.items()},
                     "additionalProperties": False,
                 },
-            } if ds.date_columns else {}),
+            } if ds.sliceable_columns else {}),
         },
         "example": {"columns": example_cols, "filters": example_filters, "limit": 1000},
     }

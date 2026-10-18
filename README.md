@@ -119,19 +119,55 @@ KOB_DATA_ROOT=/path/to/parquet uv run kob --mode rest --port 9000
   so new datasets, columns and partition values show up immediately.
 
 ```python
-from kob.tools.client import query_rest, query_rest_params, reload_rest
-from kob.core.contract import QueryRequest, Filter
+from kob.tools.client import KobClient
 
-base = "http://127.0.0.1:9000"
-reload_rest(base)                                         # rescan Parquet
-tbl = query_rest(base, QueryRequest(dataset="optionmetrics",
-                                    filters=[Filter("underlying", "in", ["AAPL", "MSFT"])]))
-tbl = query_rest_params(base, "optionmetrics", underlying=["AAPL"],
-                        date__start="2023-03-01", date__end="2023-03-31", strike__min=100)
-tbl = query_rest(base, QueryRequest(dataset="dividends", ranges={
-          "ex_date": {"start": "2024-01-01", "end": "2024-03-31"},
-          "pay_date": {"end": "2024-06-30"}}))
+kob = KobClient("http://127.0.0.1:9000")        # REST; KobClient("grpc://…:8815") for Flight
+kob.reload()                                    # rescan Parquet (same as the Swagger button)
+
+om = kob["optionmetrics"]
+tbl = om.query(om.date["2023-03-01":"2023-03-31"],   # inclusive at BOTH ends
+               om.expiry[:"2023-04-30"],              # open start
+               om.strike[90:110],                     # numbers slice too
+               underlying=["AAPL", "MSFT"],           # list  → IN
+               cp_flag="C",                           # value → =
+               columns=["date", "expiry", "strike", "mid"], limit=10_000)
+df = tbl.to_pandas()
 ```
+
+See [Python slicing](#python-slicing) for the details.
+
+## Python slicing
+
+`KobClient(url)` speaks REST (`http://`) or Flight (`grpc://`) with the same API. Index it by
+dataset, then slice columns — attributes (`ds.date`) or items (`ds["my col"]`, for names that
+aren't identifiers or clash with `query` / `request`):
+
+```python
+from kob.tools.client import KobClient
+import datetime as dt
+
+kob = KobClient("http://127.0.0.1:8000")
+px = kob["close_prices"]
+
+px.query(px.date["2024-01-01":"2024-03-31"])                 # Q1 2024, both ends included
+px.query(px.date["2024-01-01":])                             # from 2024-01-01 on
+px.query(px.date[:"2023-12-31"])                             # up to the end of 2023
+px.query(px.date[dt.date(2024, 1, 1):dt.date(2024, 3, 31)])  # date objects work too
+px.query(px.close[100:200], px.year[2022:2024])              # numbers, integer folders
+px.query(px.date["2024-03-01":"2024-03-31"], security_id=["AAPL", "MSFT"], currency="USD")
+
+dv = kob["dividends"]
+dv.query(dv.ex_date["2024-01-01":"2024-03-31"], dv.pay_date[:"2024-06-30"])   # two ranges, AND-ed
+```
+
+- **Inclusive at both ends.** `col[a:b]` means start/end — unlike a Python list, `b` *is*
+  included. No step (`col[a:b:2]` is an error).
+- **Sliceable columns:** dates, timestamps and numbers (and `dt=` / `year=`-style folders). A
+  slice on a string column is a 400 that lists the sliceable ones.
+- **Keyword filters:** a list → `IN`, a scalar → `=`, a `slice(...)` object → range. Pass
+  `Filter(col, op, value)` positionally for any other operator (`<`, `like`, `not in`, …).
+- `ds.request(...)` returns the `QueryRequest` without sending it; `kob.reload()` and
+  `kob.datasets()` work against a REST server.
 
 ## Arrow Flight vs Arrow over REST
 
@@ -219,12 +255,10 @@ One small JSON contract, used by Flight (as the descriptor/ticket) and by the HT
 **Fast path — Arrow Flight** (Python; C#, C++ clients in [`clients/`](clients/README.md)):
 
 ```python
-from kob.tools.client import query_flight
-from kob.core.contract import QueryRequest, Filter
+from kob.tools.client import KobClient
 
-table = query_flight("grpc://127.0.0.1:8815",
-                     QueryRequest(dataset="events",
-                                  filters=[Filter("region", "in", ["eu", "us"])]))
+events = KobClient("grpc://127.0.0.1:8815")["events"]
+table = events.query(events.dt["2026-06-01":"2026-06-30"], region=["eu", "us"])
 ```
 
 **Interactive / interop — HTTP** returns JSON (default) or CSV, for the browser, Excel,
@@ -236,14 +270,15 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 ```
 
 - **Operators:** `= != <> < <= > >= like "not like" ilike in "not in"`.
-- **Date ranges — always on a named column:** `ranges` maps a date column to an inclusive
-  start/end; several columns at once are AND-ed and either side may be omitted:
-  `"ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}, "pay_date": {"end": "2024-06-30"}}`.
-  Date columns are the date/timestamp columns plus `dt=2024-01-01`-style folders, listed as
-  `date_columns` in `GET /datasets/{name}`; a range on any other column is a 400. There is no
-  implicit default column (a bare top-level `start` / `end` is rejected, never ignored). A
-  date-only `end` on a timestamp column covers that whole day. REST GET:
-  `?ex_date.start=2024-01-01&ex_date.end=2024-03-31`; CLI: `--range ex_date=2024-01-01..2024-03-31`.
+- **Ranges — always on a named column:** `ranges` maps a *sliceable* column (date,
+  timestamp, numeric, plus `dt=2024-01-01` / `year=2024`-style folders — listed as
+  `sliceable_columns` in `GET /datasets/{name}`) to an inclusive start/end; several columns
+  are AND-ed, either side may be omitted:
+  `"ranges": {"ex_date": {"start": "2024-01-01", "end": "2024-03-31"}, "amount": {"start": 0.5}}`.
+  A range on any other column is a 400; there is no implicit default date column (a bare
+  top-level `start` / `end` is rejected, never ignored). A date-only `end` on a timestamp
+  column covers that whole day. Python: `ds.ex_date["2024-01-01":"2024-03-31"]`; REST GET:
+  `?ex_date.start=…&ex_date.end=…` (numbers: `?amount.min=…`); CLI: `--range ex_date=2024-01-01..2024-03-31`.
 - **Filters** may target data columns **or** partition keys — partition filters prune whole
   folders before any file is read.
 - For large or latency-sensitive pulls, use **Flight**; the HTTP `/query` is for

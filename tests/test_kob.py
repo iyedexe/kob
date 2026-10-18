@@ -261,7 +261,7 @@ def test_ranges_on_any_date_column():
     # JSON round trip (Flight / POST)
     req = QueryRequest.from_dict({"dataset": "divs", "ranges": {"pay_date": {"start": "2024-05-15"}}})
     assert engine.execute_reader(req).read_all()["amount"].to_pylist() == [4.0]
-    for bad in ({"amount": {"start": "2024-01-01"}},            # not a date column
+    for bad in ({"amount": {"start": "2024-01-01"}},            # not a number
                 {"ex_date": {"start": "2024-05-01", "end": "2024-01-01"}},
                 {"ex_date": {"from": "2024-01-01"}}):            # unknown key
         try:
@@ -281,6 +281,55 @@ def test_ranges_on_any_date_column():
         assert engine.execute_reader(req).read_all().num_rows == 2
     finally:
         catalog.enable_auto_discovery()
+
+
+def test_numeric_and_integer_partition_ranges():
+    _reset("nums2")
+    for y in (2022, 2023, 2024):
+        _write(f"nums2/year={y}/region=eu/p.parquet", pa.table({"px": [10.0, 20.0, 30.0], "qty": [1, 2, 3]}))
+    ds = catalog.get_dataset("nums2")
+    assert ds.sliceable_columns == {"px": "number", "qty": "number", "year": "number"}
+    assert "region" not in ds.sliceable_columns  # string partition: not sliceable
+    out = _q(dataset="nums2", ranges={"year": {"start": 2023}, "px": {"start": 15, "end": 30.0},
+                                      "qty": {"end": "2"}})  # numeric strings accepted
+    assert out.num_rows == 2 and set(out["year"].to_pylist()) == {2023, 2024}
+    for bad in ({"region": {"start": "a"}}, {"px": {"start": 30, "end": 10}}, {"px": {"start": "abc"}}):
+        try:
+            build_sql(QueryRequest(dataset="nums2", ranges=bad))
+            raise AssertionError(f"expected ValueError for {bad}")
+        except ValueError:
+            pass
+
+
+def test_python_client_slicing():
+    import datetime as dt
+
+    try:
+        from kob.tools.client import KobClient
+    except ModuleNotFoundError:  # the [client] extra (requests) isn't installed
+        print("        (skipped: needs the [client] extra)")
+        return
+    _reset("divs2")
+    _write("divs2/p.parquet", pa.table({"ex_date": [dt.date(2024, m, 1) for m in (1, 2, 3, 4)]}))
+    om = KobClient("http://unused")["divs2"]
+    req = om.request(om.ex_date["2024-02-01":dt.date(2024, 4, 1)], om["pay_date"][:"2024-04-15"],
+                     amount=slice(1.5, None), cp_flag="C", region=["eu", "us"], limit=5)
+    assert req.ranges == {"ex_date": {"start": "2024-02-01", "end": dt.date(2024, 4, 1)},
+                          "pay_date": {"start": None, "end": "2024-04-15"},
+                          "amount": {"start": 1.5, "end": None}}
+    assert [(f.column, f.op, f.value) for f in req.filters] == \
+        [("cp_flag", "=", "C"), ("region", "in", ["eu", "us"])]
+    assert req.to_dict()["ranges"]["ex_date"]["end"] == "2024-04-01"  # JSON-safe on the wire
+    # The slice is inclusive at both ends, end-to-end through the engine:
+    out = engine.execute_reader(om.request(om.ex_date["2024-02-01":"2024-04-01"])).read_all()
+    assert out.num_rows == 3
+    for bad in (lambda: om.ex_date["a":"b":2], lambda: om.ex_date["2024-01-01"],
+                lambda: om.request(om.x[1:2], om.x[3:4])):
+        try:
+            bad()
+            raise AssertionError("expected an error")
+        except (TypeError, ValueError):
+            pass
 
 
 # --------------------------------------------------------------------------- #
