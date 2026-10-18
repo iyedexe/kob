@@ -1,10 +1,11 @@
 """kob test suite — plain Python, no test-framework dependency.
 
-Run:   python tests/test_kob.py      (or: pytest tests/test_kob.py)
+Run:   make test   (= uv run --extra client python tests/test_kob.py; pytest works too)
 
 Each test builds a throwaway Parquet tree under a tmp dir and points the catalog
-at it, exercising discovery, the query contract, the engine, and the JSON edge
-cases end to end (no servers are started).
+at it, exercising discovery, the query contract, ranges, the engine, REST mode and
+the JSON edge cases. `test_end_to_end_rest_and_flight_servers` starts real REST and
+Flight servers in-process (skipped without the [client] extra).
 """
 from __future__ import annotations
 
@@ -330,6 +331,91 @@ def test_python_client_slicing():
             raise AssertionError("expected an error")
         except (TypeError, ValueError):
             pass
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_end_to_end_rest_and_flight_servers():
+    # Real servers in-process: `kob --mode rest` (uvicorn) and Arrow Flight, queried with the
+    # KobClient slicing API over both transports — the results must be identical.
+    import datetime as dt
+    import threading
+    import time
+
+    try:
+        import requests
+        import uvicorn
+
+        from kob.tools.client import KobClient
+    except ModuleNotFoundError:
+        print("        (skipped: needs the [client] extra)")
+        return
+    from kob.server.flight import build_server
+    from kob.server.rest import create_rest_app
+
+    _reset("e2e")
+    days = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(60)]
+    for region in ("eu", "us"):
+        _write(f"e2e/region={region}/p.parquet", pa.table({
+            "date": days, "px": [float(i) for i in range(60)], "sym": ["A", "B"] * 30}))
+
+    flight_server, flight_url = build_server("127.0.0.1", _free_port())
+    threading.Thread(target=flight_server.serve, daemon=True).start()
+    rest_port = _free_port()
+    rest = uvicorn.Server(uvicorn.Config(create_rest_app(), host="127.0.0.1", port=rest_port,
+                                         log_level="warning"))
+    threading.Thread(target=rest.run, daemon=True).start()
+    base = f"http://127.0.0.1:{rest_port}"
+    try:
+        for _ in range(100):
+            if rest.started:
+                break
+            time.sleep(0.05)
+        assert rest.started, "REST server did not start"
+
+        results = []
+        for url in (base, flight_url):
+            ds = KobClient(url, compression="zstd")["e2e"]
+            t = ds.query(ds.date["2024-01-10":"2024-01-19"], ds.px[12:15], region=["eu"], sym="A",
+                         columns=["date", "px", "sym", "region"])
+            assert min(t["date"].to_pylist()) >= dt.date(2024, 1, 10)
+            assert max(t["date"].to_pylist()) <= dt.date(2024, 1, 19)  # end is inclusive
+            assert t["px"].to_pylist() == [12.0, 14.0] and set(t["region"].to_pylist()) == {"eu"}
+            results.append(t)
+        assert results[0].equals(results[1]), "REST and Flight returned different data"
+
+        # REST extras: the generated Swagger, the GET form, reload, errors.
+        kob = KobClient(base)
+        spec = requests.get(f"{base}/openapi.json", timeout=10).json()
+        get_params = {p["name"] for p in spec["paths"]["/data/e2e"]["get"]["parameters"]}
+        assert {"date.start", "date.end", "px.min", "px.max", "region", "sym"} <= get_params
+        r = requests.get(f"{base}/data/e2e", params={"date.start": "2024-02-01", "region": "us",
+                                                     "format": "json"}, timeout=10)
+        assert r.status_code == 200 and len(r.json()) == 29
+        assert "Reload datasets" in requests.get(f"{base}/docs", timeout=10).text
+        _write("e2e_new/p.parquet", pa.table({"x": [1]}))
+        assert "e2e_new" in kob.reload()["datasets"]
+        assert "/data/e2e_new" in requests.get(f"{base}/openapi.json", timeout=10).json()["paths"]
+        for bad in (lambda: kob["e2e"].query(kob["e2e"].sym["A":"B"]),  # string: not sliceable
+                    lambda: kob["nope"].query()):
+            try:
+                bad()
+                raise AssertionError("expected an HTTP error")
+            except requests.HTTPError:
+                pass
+        r = requests.get(f"{base}/data/e2e", params={"start": "2024-01-01"}, timeout=10)
+        assert r.status_code == 400  # no implicit date column
+    finally:
+        rest.should_exit = True
+        flight_server.shutdown()
+        catalog.enable_auto_discovery()
+        _reset("e2e_new")
 
 
 # --------------------------------------------------------------------------- #

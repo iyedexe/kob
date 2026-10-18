@@ -48,6 +48,7 @@ tbl = om.query(om.date["2023-03-01":"2023-03-31"], om.strike[90:110], underlying
 ```
 
 Lower level: `query_flight`, `query_rest`, `query_http`, `reload_rest` take a `QueryRequest`.
+Full query reference (Python, JSON, REST GET, CLI): [`docs/QUERYING.md`](../docs/QUERYING.md).
 
 ## C# / .NET  (`clients/csharp/`)
 

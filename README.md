@@ -134,9 +134,13 @@ tbl = om.query(om.date["2023-03-01":"2023-03-31"],   # inclusive at BOTH ends
 df = tbl.to_pandas()
 ```
 
-See [Python slicing](#python-slicing) for the details.
+See [Python slicing](#python-slicing) for the details, and
+[`docs/QUERYING.md`](docs/QUERYING.md) for the full query reference.
 
 ## Python slicing
+
+> Full reference — every syntax (Python, JSON, REST GET, CLI) side by side:
+> [`docs/QUERYING.md`](docs/QUERYING.md).
 
 `KobClient(url)` speaks REST (`http://`) or Flight (`grpc://`) with the same API. Index it by
 dataset, then slice columns — attributes (`ds.date`) or items (`ds["my col"]`, for names that
@@ -237,6 +241,8 @@ endpoint, plus a `/flight` page describing how to pull data over Flight.
 
 ## Query
 
+> Complete reference with every syntax side by side: [`docs/QUERYING.md`](docs/QUERYING.md).
+
 One small JSON contract, used by Flight (as the descriptor/ticket) and by the HTTP
 `/query` endpoint alike:
 
@@ -297,6 +303,17 @@ curl -s -X POST 'localhost:8000/query?format=csv' -H 'content-type: application/
 
 Swagger UI at `/docs`, ReDoc at `/redoc`, raw schema at `/openapi.json`.
 Append `?refresh=true` to `/datasets` or `/datasets/{name}` to bypass the discovery cache.
+
+## Tests
+
+```bash
+make test        # = uv run --extra client python tests/test_kob.py   (pytest works too)
+```
+
+Plain Python, no test framework. Covers discovery, the query contract, ranges, the engine,
+REST mode (generated Swagger, GET parsing, manual reload) and an **end-to-end** run that
+starts real REST and Flight servers in-process and checks the Python slicing client returns
+identical Arrow tables over both. Without the `[client]` extra the end-to-end test is skipped.
 
 ## Configuration (all optional)
 
